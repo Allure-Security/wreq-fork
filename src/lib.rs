@@ -1,4 +1,5 @@
-#![deny(unused)]
+// Workaround for rustc 1.94.0 ICE in check_mod_deathness.
+#![allow(dead_code)]
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]

@@ -5,6 +5,7 @@ use tokio::net::UnixStream;
 use tokio_boring2::SslStream;
 
 use crate::tls::{TlsInfo, conn::MaybeHttpsStream};
+use crate::tls::conn::take_captured_server_hello;
 
 /// A trait for extracting TLS information from a connection.
 ///
@@ -28,6 +29,7 @@ fn extract_tls_info<S>(ssl_stream: &SslStream<S>) -> TlsInfo {
                 .map(Bytes::from)
                 .collect()
         }),
+        server_hello: take_captured_server_hello().map(Bytes::from),
     }
 }
 

@@ -21,6 +21,7 @@ use boring2::{
     ex_data::Index,
     ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslSessionCacheMode},
 };
+use boring_sys2 as ffi;
 use cache::{SessionCache, SessionKey};
 use http::Uri;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -37,6 +38,48 @@ use crate::{
         conn::ext::SslConnectorBuilderExt,
     },
 };
+
+// ── ServerHello capture via SSL_CTX_set_msg_callback ──────────────────
+// The callback fires for every TLS message during the handshake.
+// We capture the ServerHello (content_type=22, handshake_type=2) bytes
+// in a thread-local so extract_tls_info can include them in TlsInfo.
+
+thread_local! {
+    static CAPTURED_SERVER_HELLO: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Store captured ServerHello bytes and clear the thread-local.
+pub(crate) fn take_captured_server_hello() -> Option<Vec<u8>> {
+    CAPTURED_SERVER_HELLO.with(|cell| cell.borrow_mut().take())
+}
+
+/// Raw C callback for SSL_CTX_set_msg_callback.
+/// content_type=22 is Handshake. buf starts with handshake type byte:
+/// 0x02 = ServerHello.
+#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
+unsafe extern "C" fn server_hello_msg_callback(
+    is_write: std::os::raw::c_int,
+    _version: std::os::raw::c_int,
+    content_type: std::os::raw::c_int,
+    buf: *const std::os::raw::c_void,
+    len: usize,
+    _ssl: *mut ffi::SSL,
+    _arg: *mut std::os::raw::c_void,
+) {
+    // Only capture server-sent (is_write=0) Handshake (content_type=22) messages.
+    if is_write != 0 || content_type != 22 || len < 4 {
+        return;
+    }
+    let data = unsafe { std::slice::from_raw_parts(buf as *const u8, len) };
+    // Handshake type is the first byte: 0x02 = ServerHello
+    if data[0] == 0x02 {
+        // Skip the 4-byte handshake header (type + 3-byte length)
+        let hello_body = if len > 4 { &data[4..] } else { data };
+        CAPTURED_SERVER_HELLO.with(|cell| {
+            *cell.borrow_mut() = Some(hello_body.to_vec());
+        });
+    }
+}
 
 fn key_index() -> Result<Index<Ssl, SessionKey<ConnectIdentity>>, ErrorStack> {
     static IDX: LazyLock<Result<Index<Ssl, SessionKey<ConnectIdentity>>, ErrorStack>> =
@@ -534,6 +577,15 @@ impl TlsConnectorBuilder {
 
             cache
         });
+
+        // Set msg_callback to capture ServerHello bytes for JA4s fingerprinting.
+        #[allow(unsafe_code)]
+        unsafe {
+            ffi::SSL_CTX_set_msg_callback(
+                connector.as_ptr(),
+                Some(server_hello_msg_callback),
+            );
+        }
 
         Ok(TlsConnector {
             inner: Inner {
