@@ -16,12 +16,12 @@ use std::{
     task::{Context, Poll},
 };
 
+use boring_sys2 as ffi;
 use boring2::{
     error::ErrorStack,
     ex_data::Index,
     ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslSessionCacheMode},
 };
-use boring_sys2 as ffi;
 use cache::{SessionCache, SessionKey};
 use http::Uri;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -46,11 +46,17 @@ use crate::{
 
 thread_local! {
     static CAPTURED_SERVER_HELLO: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+    static CAPTURED_VERIFIED_CHAIN: std::cell::RefCell<Option<Vec<Vec<u8>>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Store captured ServerHello bytes and clear the thread-local.
 pub(crate) fn take_captured_server_hello() -> Option<Vec<u8>> {
     CAPTURED_SERVER_HELLO.with(|cell| cell.borrow_mut().take())
+}
+
+/// Store captured verified certificate chain (including root CA) and clear the thread-local.
+pub(crate) fn take_captured_verified_chain() -> Option<Vec<Vec<u8>>> {
+    CAPTURED_VERIFIED_CHAIN.with(|cell| cell.borrow_mut().take())
 }
 
 /// Raw C callback for SSL_CTX_set_msg_callback.
@@ -581,11 +587,28 @@ impl TlsConnectorBuilder {
         // Set msg_callback to capture ServerHello bytes for JA4s fingerprinting.
         #[allow(unsafe_code)]
         unsafe {
-            ffi::SSL_CTX_set_msg_callback(
-                connector.as_ptr(),
-                Some(server_hello_msg_callback),
-            );
+            ffi::SSL_CTX_set_msg_callback(connector.as_ptr(), Some(server_hello_msg_callback));
         }
+
+        // Capture the verified certificate chain (including root CA) during TLS verification.
+        // peer_cert_chain() only returns what the server sent (no root). Java SSLSession
+        // includes the root from the trust store. This callback captures the full verified chain.
+        connector.set_verify_callback(boring2::ssl::SslVerifyMode::PEER, |ok, ctx| {
+            if ok {
+                if let Some(chain) = ctx.chain() {
+                    let der_chain: Vec<Vec<u8>> = chain
+                        .iter()
+                        .filter_map(|cert| cert.to_der().ok())
+                        .collect();
+                    if !der_chain.is_empty() {
+                        CAPTURED_VERIFIED_CHAIN.with(|cell| {
+                            *cell.borrow_mut() = Some(der_chain);
+                        });
+                    }
+                }
+            }
+            ok
+        });
 
         Ok(TlsConnector {
             inner: Inner {
