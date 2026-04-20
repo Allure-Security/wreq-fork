@@ -593,13 +593,23 @@ impl TlsConnectorBuilder {
         // Capture the verified certificate chain (including root CA) during TLS verification.
         // peer_cert_chain() only returns what the server sent (no root). Java SSLSession
         // includes the root from the trust store. This callback captures the full verified chain.
-        connector.set_verify_callback(boring2::ssl::SslVerifyMode::PEER, |ok, ctx| {
-            if ok {
+        //
+        // Setting a verify_callback re-arms verification to the supplied SslVerifyMode,
+        // which overrides the NONE that set_cert_verification(false) installed upstream.
+        // To preserve the "accept any cert" contract of cert_verification(false), the
+        // callback force-returns true when verification is disabled — the handshake
+        // completes, the cert is captured, and the caller can validate post-handshake.
+        // Without this, self-signed / untrusted-CA sites fail with connect_error and
+        // never surface a cert to the caller (no BAD_CERTIFICATE possible downstream).
+        let bypass_verify = !self.cert_verification;
+        connector.set_verify_callback(boring2::ssl::SslVerifyMode::PEER, move |ok, ctx| {
+            // Capture the chain whether verification succeeded or we're in bypass
+            // mode — downstream validators need the server-sent intermediates even
+            // when the native verifier rejected the cert.
+            if ok || bypass_verify {
                 if let Some(chain) = ctx.chain() {
-                    let der_chain: Vec<Vec<u8>> = chain
-                        .iter()
-                        .filter_map(|cert| cert.to_der().ok())
-                        .collect();
+                    let der_chain: Vec<Vec<u8>> =
+                        chain.iter().filter_map(|cert| cert.to_der().ok()).collect();
                     if !der_chain.is_empty() {
                         CAPTURED_VERIFIED_CHAIN.with(|cell| {
                             *cell.borrow_mut() = Some(der_chain);
@@ -607,7 +617,7 @@ impl TlsConnectorBuilder {
                     }
                 }
             }
-            ok
+            ok || bypass_verify
         });
 
         Ok(TlsConnector {
