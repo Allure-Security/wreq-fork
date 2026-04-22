@@ -4,7 +4,7 @@ use tokio::net::TcpStream;
 use tokio::net::UnixStream;
 use tokio_boring2::SslStream;
 
-use crate::tls::conn::{take_captured_server_hello, take_captured_verified_chain};
+use crate::tls::conn::{server_hello_index, take_captured_verified_chain};
 use crate::tls::{TlsInfo, conn::MaybeHttpsStream};
 
 /// A trait for extracting TLS information from a connection.
@@ -34,7 +34,10 @@ fn extract_tls_info<S>(ssl_stream: &SslStream<S>) -> TlsInfo {
                         .collect()
                 })
             }),
-        server_hello: take_captured_server_hello().map(Bytes::from),
+        server_hello: server_hello_index()
+            .ok()
+            .and_then(|idx| ssl.ex_data(idx).cloned())
+            .map(Bytes::from),
     }
 }
 

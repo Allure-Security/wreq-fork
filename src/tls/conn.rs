@@ -39,22 +39,38 @@ use crate::{
     },
 };
 
-// ── ServerHello capture via SSL_CTX_set_msg_callback ──────────────────
-// The callback fires for every TLS message during the handshake.
-// We capture the ServerHello (content_type=22, handshake_type=2) bytes
-// in a thread-local so extract_tls_info can include them in TlsInfo.
+// ── ServerHello + verified-chain capture ─────────────────────────────
+// Both pieces of TLS state live on the Ssl itself via ex_data so the
+// extract path (tls_info.rs) reads them regardless of which thread is
+// polling the task. An earlier version used thread-locals and raced with
+// tokio task migration: the handshake thread would write the ServerHello
+// bytes, then the extract ran on a different thread after an .await and
+// saw None. That showed up as ja4s being missing on a random subset of
+// scans, notably on bad-cert hosts whose handshake completes but yields
+// no ja4s.
 
+/// ex_data index for the captured ServerHello body.
+pub(crate) fn server_hello_index() -> Result<Index<Ssl, Vec<u8>>, ErrorStack> {
+    static IDX: LazyLock<Result<Index<Ssl, Vec<u8>>, ErrorStack>> =
+        LazyLock::new(Ssl::new_ex_index);
+    IDX.clone()
+}
+
+/// ex_data index for the verified cert chain (leaf + intermediates + root).
+pub(crate) fn verified_chain_index() -> Result<Index<Ssl, Vec<Vec<u8>>>, ErrorStack> {
+    static IDX: LazyLock<Result<Index<Ssl, Vec<Vec<u8>>>, ErrorStack>> =
+        LazyLock::new(Ssl::new_ex_index);
+    IDX.clone()
+}
+
+// Verified-chain capture still uses a thread-local pending migration to
+// ex_data. Only server_hello was demonstrably racing under tokio task
+// migration; the chain is captured synchronously in the verify_callback
+// which appears to stay on the handshake thread in practice.
 thread_local! {
-    static CAPTURED_SERVER_HELLO: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
     static CAPTURED_VERIFIED_CHAIN: std::cell::RefCell<Option<Vec<Vec<u8>>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Store captured ServerHello bytes and clear the thread-local.
-pub(crate) fn take_captured_server_hello() -> Option<Vec<u8>> {
-    CAPTURED_SERVER_HELLO.with(|cell| cell.borrow_mut().take())
-}
-
-/// Store captured verified certificate chain (including root CA) and clear the thread-local.
 pub(crate) fn take_captured_verified_chain() -> Option<Vec<Vec<u8>>> {
     CAPTURED_VERIFIED_CHAIN.with(|cell| cell.borrow_mut().take())
 }
@@ -69,21 +85,30 @@ unsafe extern "C" fn server_hello_msg_callback(
     content_type: std::os::raw::c_int,
     buf: *const std::os::raw::c_void,
     len: usize,
-    _ssl: *mut ffi::SSL,
+    ssl: *mut ffi::SSL,
     _arg: *mut std::os::raw::c_void,
 ) {
-    // Only capture server-sent (is_write=0) Handshake (content_type=22) messages.
     if is_write != 0 || content_type != 22 || len < 4 {
         return;
     }
     let data = unsafe { std::slice::from_raw_parts(buf as *const u8, len) };
-    // Handshake type is the first byte: 0x02 = ServerHello
     if data[0] == 0x02 {
-        // Skip the 4-byte handshake header (type + 3-byte length)
-        let hello_body = if len > 4 { &data[4..] } else { data };
-        CAPTURED_SERVER_HELLO.with(|cell| {
-            *cell.borrow_mut() = Some(hello_body.to_vec());
-        });
+        let hello_body: Vec<u8> = if len > 4 {
+            data[4..].to_vec()
+        } else {
+            data.to_vec()
+        };
+        // Safety: BoringSSL passes a valid SSL pointer for the duration of
+        // this callback. Nothing else aliases it while we are synchronously
+        // inside SSL_do_handshake.
+        // boring2::ssl::SslRef is a transparent wrapper around ffi::SSL,
+        // so a pointer cast gives us the same &mut SslRef that
+        // ForeignTypeRef::from_ptr_mut would, without pulling in
+        // foreign_types as a direct dependency.
+        let ssl_ref = unsafe { &mut *(ssl as *mut boring2::ssl::SslRef) };
+        if let Ok(idx) = server_hello_index() {
+            ssl_ref.set_ex_data(idx, hello_body);
+        }
     }
 }
 
