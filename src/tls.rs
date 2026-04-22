@@ -14,6 +14,7 @@ pub use boring2::ssl::{CertificateCompressionAlgorithm, ExtensionType};
 use bytes::{BufMut, Bytes, BytesMut};
 
 pub use self::{
+    conn::take_captured_verified_chain,
     keylog::KeyLog,
     options::{TlsOptions, TlsOptionsBuilder},
     x509::{CertStore, CertStoreBuilder, Certificate, Identity},

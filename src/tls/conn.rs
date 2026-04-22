@@ -49,7 +49,6 @@ use crate::{
 // scans, notably on bad-cert hosts whose handshake completes but yields
 // no ja4s.
 
-/// ex_data index for the captured ServerHello body.
 pub(crate) fn server_hello_index() -> Result<Index<Ssl, Vec<u8>>, ErrorStack> {
     static IDX: LazyLock<Result<Index<Ssl, Vec<u8>>, ErrorStack>> =
         LazyLock::new(Ssl::new_ex_index);
@@ -63,15 +62,20 @@ pub(crate) fn verified_chain_index() -> Result<Index<Ssl, Vec<Vec<u8>>>, ErrorSt
     IDX.clone()
 }
 
-// Verified-chain capture still uses a thread-local pending migration to
-// ex_data. Only server_hello was demonstrably racing under tokio task
-// migration; the chain is captured synchronously in the verify_callback
-// which appears to stay on the handshake thread in practice.
 thread_local! {
     static CAPTURED_VERIFIED_CHAIN: std::cell::RefCell<Option<Vec<Vec<u8>>>> = const { std::cell::RefCell::new(None) };
 }
 
-pub(crate) fn take_captured_verified_chain() -> Option<Vec<Vec<u8>>> {
+/// Takes the peer certificate chain captured by the BoringSSL verify
+/// callback during the most recent TLS handshake on this thread, clearing
+/// the slot. The DER-encoded chain runs leaf + intermediates + root (as
+/// supplied by the verifier).
+///
+/// The regular Response success path reads this internally while building
+/// the response's TlsInfo. Callers on error paths (response timeout,
+/// mid-body connection reset) can read it to recover the cert exchanged
+/// during a handshake that completed before the downstream failure.
+pub fn take_captured_verified_chain() -> Option<Vec<Vec<u8>>> {
     CAPTURED_VERIFIED_CHAIN.with(|cell| cell.borrow_mut().take())
 }
 
