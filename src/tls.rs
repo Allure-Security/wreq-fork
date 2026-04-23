@@ -31,6 +31,7 @@ pub struct TlsInfo {
     /// Only populated when `tls_info(true)` is set on the client builder.
     /// Contains the handshake message body (after the 4-byte handshake header).
     pub(crate) server_hello: Option<Bytes>,
+    pub(crate) encrypted_extensions: Option<Bytes>,
 }
 
 impl TlsInfo {
@@ -52,6 +53,12 @@ impl TlsInfo {
     /// Useful for computing TLS fingerprints like JA4s.
     pub fn server_hello(&self) -> Option<&[u8]> {
         self.server_hello.as_deref()
+    }
+
+    /// Get the raw EncryptedExtensions message bytes from the TLS handshake.
+    /// Useful for computing TLS fingerprints like JA4s.
+    pub fn encrypted_extensions(&self) -> Option<&[u8]> {
+        self.encrypted_extensions.as_deref()
     }
 }
 

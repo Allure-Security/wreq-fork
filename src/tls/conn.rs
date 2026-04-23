@@ -55,6 +55,12 @@ pub(crate) fn server_hello_index() -> Result<Index<Ssl, Vec<u8>>, ErrorStack> {
     IDX.clone()
 }
 
+pub(crate) fn encrypted_extensions_index() -> Result<Index<Ssl, Vec<u8>>, ErrorStack> {
+    static IDX: LazyLock<Result<Index<Ssl, Vec<u8>>, ErrorStack>> =
+        LazyLock::new(Ssl::new_ex_index);
+    IDX.clone()
+}
+
 /// ex_data index for the verified cert chain (leaf + intermediates + root).
 pub(crate) fn verified_chain_index() -> Result<Index<Ssl, Vec<Vec<u8>>>, ErrorStack> {
     static IDX: LazyLock<Result<Index<Ssl, Vec<Vec<u8>>>, ErrorStack>> =
@@ -112,6 +118,16 @@ unsafe extern "C" fn server_hello_msg_callback(
         let ssl_ref = unsafe { &mut *(ssl as *mut boring2::ssl::SslRef) };
         if let Ok(idx) = server_hello_index() {
             ssl_ref.set_ex_data(idx, hello_body);
+        }
+    } else if data[0] == 0x08 {
+        let ee_body: Vec<u8> = if len > 4 {
+            data[4..].to_vec()
+        } else {
+            data.to_vec()
+        };
+        let ssl_ref = unsafe { &mut *(ssl as *mut boring2::ssl::SslRef) };
+        if let Ok(idx) = encrypted_extensions_index() {
+            ssl_ref.set_ex_data(idx, ee_body);
         }
     }
 }

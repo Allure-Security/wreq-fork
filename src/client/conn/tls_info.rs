@@ -4,7 +4,7 @@ use tokio::net::TcpStream;
 use tokio::net::UnixStream;
 use tokio_boring2::SslStream;
 
-use crate::tls::conn::{server_hello_index, take_captured_verified_chain};
+use crate::tls::conn::{server_hello_index, encrypted_extensions_index, verified_chain_index};
 use crate::tls::{TlsInfo, conn::MaybeHttpsStream};
 
 /// A trait for extracting TLS information from a connection.
@@ -23,7 +23,9 @@ fn extract_tls_info<S>(ssl_stream: &SslStream<S>) -> TlsInfo {
             .and_then(|cert| cert.to_der().ok())
             .map(Bytes::from),
         // Prefer verified chain (includes root CA) over peer_cert_chain (no root).
-        peer_certificate_chain: take_captured_verified_chain()
+        peer_certificate_chain: verified_chain_index()
+            .ok()
+            .and_then(|idx| ssl.ex_data(idx).cloned())
             .map(|chain| chain.into_iter().map(Bytes::from).collect())
             .or_else(|| {
                 ssl.peer_cert_chain().map(|chain| {
@@ -35,6 +37,10 @@ fn extract_tls_info<S>(ssl_stream: &SslStream<S>) -> TlsInfo {
                 })
             }),
         server_hello: server_hello_index()
+            .ok()
+            .and_then(|idx| ssl.ex_data(idx).cloned())
+            .map(Bytes::from),
+        encrypted_extensions: encrypted_extensions_index()
             .ok()
             .and_then(|idx| ssl.ex_data(idx).cloned())
             .map(Bytes::from),
