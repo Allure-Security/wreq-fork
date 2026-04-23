@@ -4,6 +4,7 @@
 //!
 //! - Various parts of TLS can also be configured or even disabled on the `ClientBuilder`.
 
+#[allow(clippy::type_complexity)]
 pub(crate) mod conn;
 mod keylog;
 mod options;

@@ -116,9 +116,10 @@ unsafe extern "C" fn server_hello_msg_callback(
     }
 }
 
-fn key_index() -> Result<Index<Ssl, SessionKey<ConnectIdentity>>, ErrorStack> {
-    static IDX: LazyLock<Result<Index<Ssl, SessionKey<ConnectIdentity>>, ErrorStack>> =
-        LazyLock::new(Ssl::new_ex_index);
+type KeyIndexResult = Result<Index<Ssl, SessionKey<ConnectIdentity>>, ErrorStack>;
+
+fn key_index() -> KeyIndexResult {
+    static IDX: LazyLock<KeyIndexResult> = LazyLock::new(Ssl::new_ex_index);
     IDX.clone()
 }
 
