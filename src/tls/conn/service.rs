@@ -10,11 +10,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_boring2::SslStream;
 use tower::Service;
 
-use super::{EstablishedConn, HttpsConnector, MaybeHttpsStream};
+use super::{EstablishedConn, HttpsConnector, MaybeHttpsStream, captured_chain_der_from_ssl};
 use crate::{
     client::{ConnectRequest, Connection},
     error::BoxError,
     ext::UriExt,
+    tls::CapturedChainDerError,
 };
 
 type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
@@ -27,7 +28,14 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let mut stream = SslStream::new(ssl, conn)?;
-    Pin::new(&mut stream).connect().await?;
+    if let Err(err) = Pin::new(&mut stream).connect().await {
+        return Err(match captured_chain_der_from_ssl(stream.ssl()) {
+            Some(captured_chain_der) => {
+                Box::new(CapturedChainDerError::new(err, captured_chain_der))
+            }
+            None => err.into(),
+        });
+    }
     Ok(MaybeHttpsStream::Https(stream))
 }
 

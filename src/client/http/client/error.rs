@@ -1,5 +1,6 @@
 use std::{error::Error as StdError, fmt};
 
+use bytes::Bytes;
 use http::Request;
 
 use super::pool;
@@ -11,6 +12,7 @@ use crate::{
         core::{self},
     },
     error::{BoxError, ProxyConnect},
+    tls::TlsInfo,
 };
 
 #[derive(Debug)]
@@ -18,6 +20,7 @@ pub struct Error {
     pub(super) kind: ErrorKind,
     pub(super) source: Option<BoxError>,
     pub(super) connect_info: Option<Connected>,
+    pub(super) captured_chain_der: Option<Vec<Bytes>>,
 }
 
 #[derive(Debug)]
@@ -83,10 +86,13 @@ impl Error {
             kind
         };
 
+        let captured_chain_der = crate::tls::captured_chain_der_from_error(&*error);
+
         Self {
             kind,
             source: Some(error),
             connect_info: None,
+            captured_chain_der,
         }
     }
 
@@ -96,6 +102,7 @@ impl Error {
             kind,
             source: None,
             connect_info: None,
+            captured_chain_der: None,
         }
     }
 
@@ -118,7 +125,18 @@ impl Error {
     }
 
     #[inline]
-    pub(super) fn with_connect_info(self, connect_info: Connected) -> Self {
+    pub(crate) fn captured_chain_der(&self) -> Option<&Vec<Bytes>> {
+        self.captured_chain_der.as_ref()
+    }
+
+    #[inline]
+    pub(super) fn with_connect_info(mut self, connect_info: Connected) -> Self {
+        if self.captured_chain_der.is_none() {
+            self.captured_chain_der = connect_info
+                .extra_ref::<TlsInfo>()
+                .and_then(TlsInfo::captured_chain_der_bytes)
+                .cloned();
+        }
         Self {
             connect_info: Some(connect_info),
             ..self

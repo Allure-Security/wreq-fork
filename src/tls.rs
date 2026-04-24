@@ -10,16 +10,66 @@ mod keylog;
 mod options;
 mod x509;
 
+use std::{error::Error as StdError, fmt};
+
 use boring2::ssl;
 pub use boring2::ssl::{CertificateCompressionAlgorithm, ExtensionType};
 use bytes::{BufMut, Bytes, BytesMut};
 
 pub use self::{
-    conn::take_captured_verified_chain,
     keylog::KeyLog,
     options::{TlsOptions, TlsOptionsBuilder},
     x509::{CertStore, CertStoreBuilder, Certificate, Identity},
 };
+
+use crate::error::BoxError;
+
+#[derive(Debug)]
+pub(crate) struct CapturedChainDerError {
+    source: BoxError,
+    captured_chain_der: Vec<Bytes>,
+}
+
+impl CapturedChainDerError {
+    pub(crate) fn new<E>(source: E, captured_chain_der: Vec<Vec<u8>>) -> Self
+    where
+        E: Into<BoxError>,
+    {
+        Self {
+            source: source.into(),
+            captured_chain_der: captured_chain_der.into_iter().map(Bytes::from).collect(),
+        }
+    }
+
+    pub(crate) fn captured_chain_der(&self) -> &[Bytes] {
+        &self.captured_chain_der
+    }
+}
+
+impl fmt::Display for CapturedChainDerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl StdError for CapturedChainDerError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&*self.source)
+    }
+}
+
+pub(crate) fn captured_chain_der_from_error(
+    err: &(dyn StdError + 'static),
+) -> Option<Vec<Bytes>> {
+    let mut source = Some(err);
+    while let Some(err) = source {
+        if let Some(captured) = err.downcast_ref::<CapturedChainDerError>() {
+            return Some(captured.captured_chain_der().to_vec());
+        }
+        source = err.source();
+    }
+    None
+}
 
 /// Http extension carrying extra TLS layer information.
 /// Made available to clients on responses when `tls_info` is set.
@@ -27,6 +77,12 @@ pub use self::{
 pub struct TlsInfo {
     pub(crate) peer_certificate: Option<Bytes>,
     pub(crate) peer_certificate_chain: Option<Vec<Bytes>>,
+    /// Certificate chain DER captured during TLS verification.
+    ///
+    /// This is connection-scoped evidence captured from the BoringSSL
+    /// verification callback. It may represent a chain that later validates
+    /// as bad, so callers should validate it against their own hostname.
+    pub(crate) captured_chain_der: Option<Vec<Bytes>>,
     /// Raw ServerHello message bytes captured during the TLS handshake.
     /// Only populated when `tls_info(true)` is set on the client builder.
     /// Contains the handshake message body (after the 4-byte handshake header).
@@ -47,6 +103,17 @@ impl TlsInfo {
         self.peer_certificate_chain
             .as_ref()
             .map(|v| v.iter().map(|b| b.as_ref()))
+    }
+
+    /// Get the captured certificate chain DER from the TLS verification callback.
+    pub fn captured_chain_der(&self) -> Option<impl Iterator<Item = &[u8]>> {
+        self.captured_chain_der
+            .as_ref()
+            .map(|v| v.iter().map(|b| b.as_ref()))
+    }
+
+    pub(crate) fn captured_chain_der_bytes(&self) -> Option<&Vec<Bytes>> {
+        self.captured_chain_der.as_ref()
     }
 
     /// Get the raw ServerHello message bytes from the TLS handshake.

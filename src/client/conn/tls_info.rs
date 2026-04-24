@@ -4,7 +4,9 @@ use tokio::net::TcpStream;
 use tokio::net::UnixStream;
 use tokio_boring2::SslStream;
 
-use crate::tls::conn::{server_hello_index, encrypted_extensions_index, verified_chain_index};
+use crate::tls::conn::{
+    captured_chain_der_from_ssl, encrypted_extensions_index, server_hello_index,
+};
 use crate::tls::{TlsInfo, conn::MaybeHttpsStream};
 
 /// A trait for extracting TLS information from a connection.
@@ -17,25 +19,25 @@ pub trait TlsInfoFactory {
 
 fn extract_tls_info<S>(ssl_stream: &SslStream<S>) -> TlsInfo {
     let ssl = ssl_stream.ssl();
+    let captured_chain_der =
+        captured_chain_der_from_ssl(ssl).map(|chain| chain.into_iter().map(Bytes::from).collect());
     TlsInfo {
         peer_certificate: ssl
             .peer_certificate()
             .and_then(|cert| cert.to_der().ok())
             .map(Bytes::from),
-        // Prefer verified chain (includes root CA) over peer_cert_chain (no root).
-        peer_certificate_chain: verified_chain_index()
-            .ok()
-            .and_then(|idx| ssl.ex_data(idx).cloned())
-            .map(|chain| chain.into_iter().map(Bytes::from).collect())
-            .or_else(|| {
-                ssl.peer_cert_chain().map(|chain| {
-                    chain
-                        .iter()
-                        .filter_map(|cert| cert.to_der().ok())
-                        .map(Bytes::from)
-                        .collect()
-                })
-            }),
+        // Prefer the verifier-captured chain over peer_cert_chain() because
+        // it can include the trust-anchor/root material Java SSLSession exposes.
+        peer_certificate_chain: captured_chain_der.clone().or_else(|| {
+            ssl.peer_cert_chain().map(|chain| {
+                chain
+                    .iter()
+                    .filter_map(|cert| cert.to_der().ok())
+                    .map(Bytes::from)
+                    .collect()
+            })
+        }),
+        captured_chain_der,
         server_hello: server_hello_index()
             .ok()
             .and_then(|idx| ssl.ex_data(idx).cloned())

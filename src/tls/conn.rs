@@ -21,6 +21,7 @@ use boring2::{
     error::ErrorStack,
     ex_data::Index,
     ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslSessionCacheMode},
+    x509::X509StoreContext,
 };
 use cache::{SessionCache, SessionKey};
 use http::Uri;
@@ -39,8 +40,8 @@ use crate::{
     },
 };
 
-// ── ServerHello + verified-chain capture ─────────────────────────────
-// Both pieces of TLS state live on the Ssl itself via ex_data so the
+// ── ServerHello + captured-chain capture ─────────────────────────────
+// TLS capture state lives on the Ssl itself via ex_data so the
 // extract path (tls_info.rs) reads them regardless of which thread is
 // polling the task. An earlier version used thread-locals and raced with
 // tokio task migration: the handshake thread would write the ServerHello
@@ -61,28 +62,21 @@ pub(crate) fn encrypted_extensions_index() -> Result<Index<Ssl, Vec<u8>>, ErrorS
     IDX.clone()
 }
 
-/// ex_data index for the verified cert chain (leaf + intermediates + root).
-pub(crate) fn verified_chain_index() -> Result<Index<Ssl, Vec<Vec<u8>>>, ErrorStack> {
+/// ex_data index for the captured certificate chain DER bytes.
+///
+/// The chain may be verifier-built or verifier-observed depending on the
+/// handshake outcome, so do not call it "verified" here. MarcoPolo validates
+/// this DER post-handshake against the scan hostname.
+pub(crate) fn captured_chain_der_index() -> Result<Index<Ssl, Vec<Vec<u8>>>, ErrorStack> {
     static IDX: LazyLock<Result<Index<Ssl, Vec<Vec<u8>>>, ErrorStack>> =
         LazyLock::new(Ssl::new_ex_index);
     IDX.clone()
 }
 
-thread_local! {
-    static CAPTURED_VERIFIED_CHAIN: std::cell::RefCell<Option<Vec<Vec<u8>>>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Takes the peer certificate chain captured by the BoringSSL verify
-/// callback during the most recent TLS handshake on this thread, clearing
-/// the slot. The DER-encoded chain runs leaf + intermediates + root (as
-/// supplied by the verifier).
-///
-/// The regular Response success path reads this internally while building
-/// the response's TlsInfo. Callers on error paths (response timeout,
-/// mid-body connection reset) can read it to recover the cert exchanged
-/// during a handshake that completed before the downstream failure.
-pub fn take_captured_verified_chain() -> Option<Vec<Vec<u8>>> {
-    CAPTURED_VERIFIED_CHAIN.with(|cell| cell.borrow_mut().take())
+pub(crate) fn captured_chain_der_from_ssl(ssl: &boring2::ssl::SslRef) -> Option<Vec<Vec<u8>>> {
+    captured_chain_der_index()
+        .ok()
+        .and_then(|idx| ssl.ex_data(idx).cloned())
 }
 
 /// Raw C callback for SSL_CTX_set_msg_callback.
@@ -636,9 +630,10 @@ impl TlsConnectorBuilder {
             ffi::SSL_CTX_set_msg_callback(connector.as_ptr(), Some(server_hello_msg_callback));
         }
 
-        // Capture the verified certificate chain (including root CA) during TLS verification.
+        // Capture certificate chain DER during TLS verification.
         // peer_cert_chain() only returns what the server sent (no root). Java SSLSession
-        // includes the root from the trust store. This callback captures the full verified chain.
+        // includes the root from the trust store. This callback captures the verifier's
+        // chain when available and stores it on the Ssl connection object.
         //
         // Setting a verify_callback re-arms verification to the supplied SslVerifyMode,
         // which overrides the NONE that set_cert_verification(false) installed upstream.
@@ -657,9 +652,13 @@ impl TlsConnectorBuilder {
                     let der_chain: Vec<Vec<u8>> =
                         chain.iter().filter_map(|cert| cert.to_der().ok()).collect();
                     if !der_chain.is_empty() {
-                        CAPTURED_VERIFIED_CHAIN.with(|cell| {
-                            *cell.borrow_mut() = Some(der_chain);
-                        });
+                        if let (Ok(ssl_idx), Ok(chain_idx)) =
+                            (X509StoreContext::ssl_idx(), captured_chain_der_index())
+                        {
+                            if let Some(ssl) = ctx.ex_data_mut(ssl_idx) {
+                                ssl.set_ex_data(chain_idx, der_chain);
+                            }
+                        }
                     }
                 }
             }

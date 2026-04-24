@@ -1,5 +1,6 @@
 use std::{error::Error as StdError, fmt, io};
 
+use bytes::Bytes;
 use http::Uri;
 
 use crate::{StatusCode, client::ext::ReasonPhrase, util::Escape};
@@ -23,6 +24,7 @@ struct Inner {
     kind: Kind,
     source: Option<BoxError>,
     uri: Option<Uri>,
+    captured_chain_der: Option<Vec<Bytes>>,
 }
 
 impl Error {
@@ -30,11 +32,17 @@ impl Error {
     where
         E: Into<BoxError>,
     {
+        let source = source.map(Into::into);
+        let captured_chain_der = source
+            .as_deref()
+            .and_then(|err| captured_chain_der_from_source(err));
+
         Error {
             inner: Box::new(Inner {
                 kind,
-                source: source.map(Into::into),
+                source,
                 uri: None,
+                captured_chain_der,
             }),
         }
     }
@@ -125,6 +133,15 @@ impl Error {
     pub fn without_uri(mut self) -> Self {
         self.inner.uri = None;
         self
+    }
+
+    /// Returns the certificate chain DER captured during TLS verification, if
+    /// the connection reached the TLS certificate stage before failing.
+    pub fn captured_chain_der(&self) -> Option<impl Iterator<Item = &[u8]>> {
+        self.inner
+            .captured_chain_der
+            .as_ref()
+            .map(|chain| chain.iter().map(|der| der.as_ref()))
     }
 
     /// Returns true if the error is from a type Builder.
@@ -261,6 +278,24 @@ impl Error {
             _ => None,
         }
     }
+}
+
+fn captured_chain_der_from_source(err: &(dyn StdError + 'static)) -> Option<Vec<Bytes>> {
+    let mut source = Some(err);
+    while let Some(err) = source {
+        if let Some(captured) = crate::tls::captured_chain_der_from_error(err) {
+            return Some(captured);
+        }
+
+        if let Some(client_err) = err.downcast_ref::<crate::client::Error>() {
+            if let Some(captured) = client_err.captured_chain_der() {
+                return Some(captured.clone());
+            }
+        }
+
+        source = err.source();
+    }
+    None
 }
 
 /// Maps external timeout errors (such as `tower::timeout::error::Elapsed`)

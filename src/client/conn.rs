@@ -9,6 +9,7 @@ mod uds;
 mod verbose;
 
 use std::{
+    any::{Any, TypeId},
     fmt::{self, Debug, Formatter},
     sync::{
         Arc,
@@ -96,6 +97,7 @@ struct Extra(Box<dyn ExtraInner>);
 trait ExtraInner: Send + Sync + Debug {
     fn clone_box(&self) -> Box<dyn ExtraInner>;
     fn set(&self, res: &mut Extensions);
+    fn get(&self, type_id: TypeId) -> Option<&dyn Any>;
 }
 
 // This indirection allows the `Connected` to have a type-erased "extra" value,
@@ -195,6 +197,13 @@ impl Connected {
         }
     }
 
+    pub(crate) fn extra_ref<T: 'static>(&self) -> Option<&T> {
+        self.extra
+            .as_ref()
+            .and_then(|extra| extra.get(TypeId::of::<T>()))
+            .and_then(|extra| extra.downcast_ref::<T>())
+    }
+
     /// Set that the proxy was used for this connected transport.
     pub fn proxy(mut self, proxy: Intercept) -> Connected {
         self.proxy.is_proxied = true;
@@ -277,6 +286,11 @@ impl Extra {
     fn set(&self, res: &mut Extensions) {
         self.0.set(res);
     }
+
+    #[inline]
+    fn get(&self, type_id: TypeId) -> Option<&dyn Any> {
+        self.0.get(type_id)
+    }
 }
 
 impl Clone for Extra {
@@ -297,6 +311,14 @@ where
 
     fn set(&self, res: &mut Extensions) {
         res.insert(self.0.clone());
+    }
+
+    fn get(&self, type_id: TypeId) -> Option<&dyn Any> {
+        if TypeId::of::<T>() == type_id {
+            Some(&self.0)
+        } else {
+            None
+        }
     }
 }
 
@@ -319,5 +341,15 @@ where
     fn set(&self, res: &mut Extensions) {
         self.0.set(res);
         res.insert(self.1.clone());
+    }
+
+    fn get(&self, type_id: TypeId) -> Option<&dyn Any> {
+        self.0.get(type_id).or_else(|| {
+            if TypeId::of::<T>() == type_id {
+                Some(&self.1)
+            } else {
+                None
+            }
+        })
     }
 }
