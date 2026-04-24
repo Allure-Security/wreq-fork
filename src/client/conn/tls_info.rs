@@ -21,13 +21,20 @@ fn extract_tls_info<S>(ssl_stream: &SslStream<S>) -> TlsInfo {
     let ssl = ssl_stream.ssl();
     let captured_chain_der =
         captured_chain_der_from_ssl(ssl).map(|chain| chain.into_iter().map(Bytes::from).collect());
+    let peer_certificate = ssl
+        .peer_certificate()
+        .and_then(|cert| cert.to_der().ok())
+        .map(Bytes::from)
+        .or_else(|| {
+            captured_chain_der
+                .as_ref()
+                .and_then(|chain: &Vec<Bytes>| chain.first().cloned())
+        });
     TlsInfo {
-        peer_certificate: ssl
-            .peer_certificate()
-            .and_then(|cert| cert.to_der().ok())
-            .map(Bytes::from),
-        // Prefer the verifier-captured chain over peer_cert_chain() because
-        // it can include the trust-anchor/root material Java SSLSession exposes.
+        peer_certificate,
+        // Prefer the handshake-message-captured chain over peer_cert_chain()
+        // because BoringSSL does not always populate peer_cert_chain() when
+        // verification is disabled.
         peer_certificate_chain: captured_chain_der.clone().or_else(|| {
             ssl.peer_cert_chain().map(|chain| {
                 chain

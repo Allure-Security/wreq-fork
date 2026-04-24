@@ -78,9 +78,110 @@ pub(crate) fn captured_chain_der_from_ssl(ssl: &boring2::ssl::SslRef) -> Option<
         .and_then(|idx| ssl.ex_data(idx).cloned())
 }
 
+fn read_u24(input: &[u8]) -> Option<usize> {
+    if input.len() < 3 {
+        return None;
+    }
+    Some(((input[0] as usize) << 16) | ((input[1] as usize) << 8) | input[2] as usize)
+}
+
+fn parse_tls12_certificate_list(body: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let list_len = read_u24(body)?;
+    let list_start = 3usize;
+    let list_end = list_start.checked_add(list_len)?;
+    if list_end != body.len() {
+        return None;
+    }
+
+    let mut pos = list_start;
+    let mut chain = Vec::new();
+    while pos < list_end {
+        let cert_len = read_u24(body.get(pos..pos + 3)?)?;
+        pos = pos.checked_add(3)?;
+        let cert_end = pos.checked_add(cert_len)?;
+        if cert_end > list_end {
+            return None;
+        }
+        chain.push(body[pos..cert_end].to_vec());
+        pos = cert_end;
+    }
+
+    if chain.is_empty() { None } else { Some(chain) }
+}
+
+fn parse_tls13_certificate_list(body: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let context_len = *body.first()? as usize;
+    let mut pos = 1usize.checked_add(context_len)?;
+    if pos + 3 > body.len() {
+        return None;
+    }
+
+    let list_len = read_u24(&body[pos..pos + 3])?;
+    pos = pos.checked_add(3)?;
+    let list_end = pos.checked_add(list_len)?;
+    if list_end != body.len() {
+        return None;
+    }
+
+    let mut chain = Vec::new();
+    while pos < list_end {
+        if pos + 3 > list_end {
+            return None;
+        }
+        let cert_len = read_u24(&body[pos..pos + 3])?;
+        pos = pos.checked_add(3)?;
+        let cert_end = pos.checked_add(cert_len)?;
+        let ext_len_pos_end = cert_end.checked_add(2)?;
+        if ext_len_pos_end > list_end {
+            return None;
+        }
+        chain.push(body[pos..cert_end].to_vec());
+        pos = cert_end;
+
+        let ext_len = ((body[pos] as usize) << 8) | body[pos + 1] as usize;
+        pos = pos.checked_add(2)?;
+        let ext_end = pos.checked_add(ext_len)?;
+        if ext_end > list_end {
+            return None;
+        }
+        pos = ext_end;
+    }
+
+    if chain.is_empty() { None } else { Some(chain) }
+}
+
+fn parse_certificate_message_der(data: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if data.len() < 4 || data[0] != 0x0b {
+        return None;
+    }
+
+    let body_len = read_u24(&data[1..4])?;
+    let body_end = 4usize.checked_add(body_len)?;
+    if body_end != data.len() {
+        return None;
+    }
+
+    let body = &data[4..];
+    parse_tls13_certificate_list(body).or_else(|| parse_tls12_certificate_list(body))
+}
+
+#[allow(unsafe_code)]
+fn store_captured_chain_der(ssl: *mut ffi::SSL, chain: Vec<Vec<u8>>) {
+    if chain.is_empty() {
+        return;
+    }
+    // Safety: BoringSSL passes a valid SSL pointer for the duration of this
+    // callback. Nothing else aliases it while we are synchronously inside
+    // SSL_do_handshake.
+    let ssl_ref = unsafe { &mut *(ssl as *mut boring2::ssl::SslRef) };
+    if let Ok(idx) = captured_chain_der_index() {
+        ssl_ref.set_ex_data(idx, chain);
+    }
+}
+
 /// Raw C callback for SSL_CTX_set_msg_callback.
 /// content_type=22 is Handshake. buf starts with handshake type byte:
-/// 0x02 = ServerHello.
+/// 0x02 = ServerHello, 0x08 = EncryptedExtensions, 0x0b = Certificate.
 #[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
 unsafe extern "C" fn server_hello_msg_callback(
     is_write: std::os::raw::c_int,
@@ -122,6 +223,69 @@ unsafe extern "C" fn server_hello_msg_callback(
         if let Ok(idx) = encrypted_extensions_index() {
             ssl_ref.set_ex_data(idx, ee_body);
         }
+    } else if data[0] == 0x0b {
+        if let Some(chain) = parse_certificate_message_der(data) {
+            store_captured_chain_der(ssl, chain);
+        }
+    }
+}
+
+#[cfg(test)]
+mod cert_message_tests {
+    use super::parse_certificate_message_der;
+
+    fn push_u24(out: &mut Vec<u8>, value: usize) {
+        out.push(((value >> 16) & 0xff) as u8);
+        out.push(((value >> 8) & 0xff) as u8);
+        out.push((value & 0xff) as u8);
+    }
+
+    fn handshake(mut body: Vec<u8>) -> Vec<u8> {
+        let mut out = vec![0x0b];
+        push_u24(&mut out, body.len());
+        out.append(&mut body);
+        out
+    }
+
+    #[test]
+    fn parses_tls12_certificate_message() {
+        let leaf = vec![0x30, 0x82, 0x01, 0x02];
+        let intermediate = vec![0x30, 0x82, 0x03];
+        let mut list = Vec::new();
+        push_u24(&mut list, leaf.len());
+        list.extend_from_slice(&leaf);
+        push_u24(&mut list, intermediate.len());
+        list.extend_from_slice(&intermediate);
+
+        let mut body = Vec::new();
+        push_u24(&mut body, list.len());
+        body.extend_from_slice(&list);
+
+        let parsed = parse_certificate_message_der(&handshake(body)).unwrap();
+        assert_eq!(parsed, vec![leaf, intermediate]);
+    }
+
+    #[test]
+    fn parses_tls13_certificate_message_with_extensions() {
+        let leaf = vec![0x30, 0x82, 0x05];
+        let mut list = Vec::new();
+        push_u24(&mut list, leaf.len());
+        list.extend_from_slice(&leaf);
+        list.extend_from_slice(&[0x00, 0x02, 0xaa, 0xbb]);
+
+        let mut body = vec![0x00];
+        push_u24(&mut body, list.len());
+        body.extend_from_slice(&list);
+
+        let parsed = parse_certificate_message_der(&handshake(body)).unwrap();
+        assert_eq!(parsed, vec![leaf]);
+    }
+
+    #[test]
+    fn rejects_truncated_certificate_message() {
+        let mut data = handshake(vec![0x00, 0x00, 0x04, 0x00, 0x00, 0x03, 0x30]);
+        data.pop();
+        assert!(parse_certificate_message_der(&data).is_none());
     }
 }
 
@@ -629,44 +793,11 @@ impl TlsConnectorBuilder {
             ffi::SSL_CTX_set_msg_callback(connector.as_ptr(), Some(server_hello_msg_callback));
         }
 
-        // Capture certificate chain DER during TLS verification.
-        //
-        // BoringSSL exposes two verify callback APIs:
-        //  - set_verify_callback: OpenSSL-compatible, called once per cert in the
-        //    chain via the X509_STORE_CTX path. Requires a pre-populated trust
-        //    store to even enter the verification state machine; with
-        //    `no_default_verify_builder` + SSL_VERIFY_NONE set upstream by
-        //    set_cert_verification(false), the state machine is skipped on the
-        //    fast path for some TLS 1.2/1.3 flows, so the callback never fires
-        //    and no chain lands in ex_data.
-        //  - set_custom_verify_callback: BoringSSL-native, called once after
-        //    the server Certificate message is received, gets &mut SslRef
-        //    directly, and runs regardless of whether a trust store is
-        //    configured. This is what we want.
-        //
-        // With cert_verification=false we always return Ok(()) (accept any
-        // cert); the caller validates post-handshake against the scan hostname.
-        // With cert_verification=true we still accept any cert (the default
-        // boring verify-path is no longer active because we installed this
-        // callback) but we still write the chain — downstream validators that
-        // care about trusted-CA state run against the captured chain directly.
-        let bypass_verify = !self.cert_verification;
-        let _ = bypass_verify; // always accept for now; post-handshake validator decides
-        connector.set_custom_verify_callback(
-            boring2::ssl::SslVerifyMode::PEER,
-            move |ssl: &mut boring2::ssl::SslRef| {
-                if let Some(chain) = ssl.peer_cert_chain() {
-                    let der_chain: Vec<Vec<u8>> =
-                        chain.iter().filter_map(|cert| cert.to_der().ok()).collect();
-                    if !der_chain.is_empty() {
-                        if let Ok(chain_idx) = captured_chain_der_index() {
-                            ssl.set_ex_data(chain_idx, der_chain);
-                        }
-                    }
-                }
-                Ok(())
-            },
-        );
+        // Certificate DER is captured in `server_hello_msg_callback` from the
+        // raw server Certificate handshake message. Do not install a custom
+        // verify callback here: BoringSSL custom verification replaces the
+        // normal verifier, so returning Ok(()) would silently disable
+        // `cert_verification(true)` for non-MarcoPolo callers.
 
         Ok(TlsConnector {
             inner: Inner {
