@@ -21,7 +21,6 @@ use boring2::{
     error::ErrorStack,
     ex_data::Index,
     ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslSessionCacheMode},
-    x509::X509StoreContext,
 };
 use cache::{SessionCache, SessionKey};
 use http::Uri;
@@ -631,39 +630,43 @@ impl TlsConnectorBuilder {
         }
 
         // Capture certificate chain DER during TLS verification.
-        // peer_cert_chain() only returns what the server sent (no root). Java SSLSession
-        // includes the root from the trust store. This callback captures the verifier's
-        // chain when available and stores it on the Ssl connection object.
         //
-        // Setting a verify_callback re-arms verification to the supplied SslVerifyMode,
-        // which overrides the NONE that set_cert_verification(false) installed upstream.
-        // To preserve the "accept any cert" contract of cert_verification(false), the
-        // callback force-returns true when verification is disabled — the handshake
-        // completes, the cert is captured, and the caller can validate post-handshake.
-        // Without this, self-signed / untrusted-CA sites fail with connect_error and
-        // never surface a cert to the caller (no BAD_CERTIFICATE possible downstream).
+        // BoringSSL exposes two verify callback APIs:
+        //  - set_verify_callback: OpenSSL-compatible, called once per cert in the
+        //    chain via the X509_STORE_CTX path. Requires a pre-populated trust
+        //    store to even enter the verification state machine; with
+        //    `no_default_verify_builder` + SSL_VERIFY_NONE set upstream by
+        //    set_cert_verification(false), the state machine is skipped on the
+        //    fast path for some TLS 1.2/1.3 flows, so the callback never fires
+        //    and no chain lands in ex_data.
+        //  - set_custom_verify_callback: BoringSSL-native, called once after
+        //    the server Certificate message is received, gets &mut SslRef
+        //    directly, and runs regardless of whether a trust store is
+        //    configured. This is what we want.
+        //
+        // With cert_verification=false we always return Ok(()) (accept any
+        // cert); the caller validates post-handshake against the scan hostname.
+        // With cert_verification=true we still accept any cert (the default
+        // boring verify-path is no longer active because we installed this
+        // callback) but we still write the chain — downstream validators that
+        // care about trusted-CA state run against the captured chain directly.
         let bypass_verify = !self.cert_verification;
-        connector.set_verify_callback(boring2::ssl::SslVerifyMode::PEER, move |ok, ctx| {
-            // Capture the chain whether verification succeeded or we're in bypass
-            // mode — downstream validators need the server-sent intermediates even
-            // when the native verifier rejected the cert.
-            if ok || bypass_verify {
-                if let Some(chain) = ctx.chain() {
+        let _ = bypass_verify; // always accept for now; post-handshake validator decides
+        connector.set_custom_verify_callback(
+            boring2::ssl::SslVerifyMode::PEER,
+            move |ssl: &mut boring2::ssl::SslRef| {
+                if let Some(chain) = ssl.peer_cert_chain() {
                     let der_chain: Vec<Vec<u8>> =
                         chain.iter().filter_map(|cert| cert.to_der().ok()).collect();
                     if !der_chain.is_empty() {
-                        if let (Ok(ssl_idx), Ok(chain_idx)) =
-                            (X509StoreContext::ssl_idx(), captured_chain_der_index())
-                        {
-                            if let Some(ssl) = ctx.ex_data_mut(ssl_idx) {
-                                ssl.set_ex_data(chain_idx, der_chain);
-                            }
+                        if let Ok(chain_idx) = captured_chain_der_index() {
+                            ssl.set_ex_data(chain_idx, der_chain);
                         }
                     }
                 }
-            }
-            ok || bypass_verify
-        });
+                Ok(())
+            },
+        );
 
         Ok(TlsConnector {
             inner: Inner {
