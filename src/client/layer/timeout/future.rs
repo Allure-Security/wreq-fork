@@ -10,7 +10,10 @@ use pin_project_lite::pin_project;
 use tokio::time::Sleep;
 
 use super::body::TimeoutBody;
-use crate::error::{BoxError, Error, TimedOut};
+use crate::{
+    error::{BoxError, Error, TimedOut},
+    tls::{CapturedChainDerError, TlsCaptureSlot},
+};
 
 pin_project! {
     /// [`Timeout`] response future
@@ -21,7 +24,20 @@ pin_project! {
         pub(crate) total_timeout: Option<Sleep>,
         #[pin]
         pub(crate) read_timeout: Option<Sleep>,
+        pub(crate) tls_capture: Option<TlsCaptureSlot>,
     }
+}
+
+fn timeout_error(tls_capture: Option<&TlsCaptureSlot>) -> BoxError {
+    if let Some(chain) = tls_capture.and_then(TlsCaptureSlot::captured_chain_der) {
+        return Error::request(CapturedChainDerError::new(
+            TimedOut,
+            chain.into_iter().map(|der| der.to_vec()).collect(),
+        ))
+        .into();
+    }
+
+    Error::request(TimedOut).into()
 }
 
 impl<F, T, E> Future for ResponseFuture<F>
@@ -44,7 +60,7 @@ where
         let mut check_timeout = |sleep: Option<Pin<&mut Sleep>>| {
             if let Some(sleep) = sleep {
                 if sleep.poll(cx).is_ready() {
-                    return Some(Poll::Ready(Err(Error::request(TimedOut).into())));
+                    return Some(Poll::Ready(Err(timeout_error(this.tls_capture.as_ref()))));
                 }
             }
             None
@@ -61,6 +77,28 @@ where
         }
 
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timeout_error;
+    use crate::tls::TlsCaptureSlot;
+
+    #[test]
+    fn timeout_error_includes_captured_tls_chain() {
+        let capture = TlsCaptureSlot::default();
+        capture.store_chain_der(vec![vec![1, 2, 3], vec![4, 5, 6]]);
+
+        let err = timeout_error(Some(&capture));
+        let err = err.downcast::<crate::Error>().expect("wreq error");
+        let chain = err
+            .captured_chain_der()
+            .expect("captured chain")
+            .map(|der| der.to_vec())
+            .collect::<Vec<_>>();
+
+        assert_eq!(chain, vec![vec![1, 2, 3], vec![4, 5, 6]]);
     }
 }
 

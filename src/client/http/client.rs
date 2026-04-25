@@ -47,7 +47,7 @@ use crate::{
     config::RequestConfig,
     error::BoxError,
     hash::{HASHER, HashMemo},
-    tls::AlpnProtocol,
+    tls::{AlpnProtocol, TlsCaptureSlot, TlsInfo},
 };
 
 type BoxSendFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -62,6 +62,7 @@ type BoxSendFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub struct ConnectRequest {
     uri: Uri,
     identifier: ConnectIdentity,
+    tls_capture: Option<TlsCaptureSlot>,
 }
 
 // ===== impl ConnectRequest =====
@@ -69,7 +70,11 @@ pub struct ConnectRequest {
 impl ConnectRequest {
     /// Create a new [`ConnectRequest`] with the given URI and identifier.
     #[inline]
-    fn new<T>(uri: Uri, identifier: T) -> ConnectRequest
+    fn new<T>(
+        uri: Uri,
+        identifier: T,
+        tls_capture: Option<TlsCaptureSlot>,
+    ) -> ConnectRequest
     where
         T: Into<Option<RequestOptions>>,
     {
@@ -79,6 +84,7 @@ impl ConnectRequest {
                 ConnectExtra::new(uri, identifier),
                 HASHER,
             )),
+            tls_capture,
         }
     }
 
@@ -104,6 +110,11 @@ impl ConnectRequest {
     #[inline]
     pub(crate) fn extra(&self) -> &ConnectExtra {
         self.identifier.as_ref().as_ref()
+    }
+
+    #[inline]
+    pub(crate) fn tls_capture(&self) -> Option<TlsCaptureSlot> {
+        self.tls_capture.clone()
     }
 }
 
@@ -183,6 +194,7 @@ where
         // builder. This allows each request to override HTTP/1 and HTTP/2 options as
         // needed.
         let options = RequestConfig::<RequestOptions>::remove(req.extensions_mut());
+        let tls_capture = req.extensions().get::<TlsCaptureSlot>().cloned();
 
         // Apply HTTP/1 and HTTP/2 options if provided
         if let Some(opts) = options.as_ref().map(RequestOptions::transport_opts) {
@@ -195,7 +207,7 @@ where
             }
         }
 
-        let connect_req = ConnectRequest::new(uri, options);
+        let connect_req = ConnectRequest::new(uri, options, tls_capture);
         ResponseFuture::new(this.send_request(req, connect_req))
     }
 
@@ -237,12 +249,20 @@ where
         mut req: Request<B>,
         connect_req: ConnectRequest,
     ) -> Result<Response<Incoming>, TrySendError<B>> {
+        let tls_capture = connect_req.tls_capture();
         let mut pooled = self
             .connection_for(connect_req)
             .await
             // `connection_for` already retries checkout errors, so if
             // it returns an error, there's not much else to retry
             .map_err(TrySendError::Nope)?;
+
+        if let Some(capture) = tls_capture
+            && let Some(tls_info) = pooled.conn_info.extra_ref::<TlsInfo>()
+            && let Some(chain) = tls_info.captured_chain_der_bytes()
+        {
+            capture.store_chain_der(chain.iter().map(|der| der.to_vec()).collect());
+        }
 
         if pooled.is_http1() {
             if req.version() == Version::HTTP_2 {

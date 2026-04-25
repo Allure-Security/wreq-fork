@@ -10,7 +10,11 @@ mod keylog;
 mod options;
 mod x509;
 
-use std::{error::Error as StdError, fmt};
+use std::{
+    error::Error as StdError,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use boring2::ssl;
 pub use boring2::ssl::{CertificateCompressionAlgorithm, ExtensionType};
@@ -69,6 +73,38 @@ pub(crate) fn captured_chain_der_from_error(
         source = err.source();
     }
     None
+}
+
+/// Shared per-request TLS capture slot used by request timeouts.
+///
+/// A response-header timeout can fire after TLS completed but before a
+/// `Response` exists. The connector writes the handshake certificate chain here
+/// as soon as `SSL_connect` succeeds, and the timeout layer wraps the timeout
+/// error with that chain so callers can still classify the certificate.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TlsCaptureSlot {
+    captured_chain_der: Arc<Mutex<Option<Vec<Bytes>>>>,
+}
+
+impl TlsCaptureSlot {
+    pub(crate) fn store_chain_der(&self, chain: Vec<Vec<u8>>) {
+        if chain.is_empty() {
+            return;
+        }
+
+        let mut captured = self
+            .captured_chain_der
+            .lock()
+            .expect("tls capture slot poisoned");
+        *captured = Some(chain.into_iter().map(Bytes::from).collect());
+    }
+
+    pub(crate) fn captured_chain_der(&self) -> Option<Vec<Bytes>> {
+        self.captured_chain_der
+            .lock()
+            .expect("tls capture slot poisoned")
+            .clone()
+    }
 }
 
 /// Http extension carrying extra TLS layer information.

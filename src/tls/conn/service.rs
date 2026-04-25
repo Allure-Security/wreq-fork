@@ -15,7 +15,7 @@ use crate::{
     client::{ConnectRequest, Connection},
     error::BoxError,
     ext::UriExt,
-    tls::CapturedChainDerError,
+    tls::{CapturedChainDerError, TlsCaptureSlot},
 };
 
 type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
@@ -23,6 +23,7 @@ type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 async fn perform_handshake<T>(
     ssl: boring2::ssl::Ssl,
     conn: T,
+    tls_capture: Option<TlsCaptureSlot>,
 ) -> Result<MaybeHttpsStream<T>, BoxError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -35,6 +36,11 @@ where
             }
             None => err.into(),
         });
+    }
+    if let Some(capture) = tls_capture
+        && let Some(captured_chain_der) = captured_chain_der_from_ssl(stream.ssl())
+    {
+        capture.store_chain_der(captured_chain_der);
     }
     Ok(MaybeHttpsStream::Https(stream))
 }
@@ -68,7 +74,7 @@ where
             }
 
             let ssl = inner.setup_ssl(uri)?;
-            perform_handshake(ssl, conn).await
+            perform_handshake(ssl, conn, None).await
         };
 
         Box::pin(f)
@@ -104,8 +110,9 @@ where
                 return Ok(MaybeHttpsStream::Http(conn));
             }
 
+            let tls_capture = req.tls_capture();
             let ssl = inner.setup_ssl2(req)?;
-            perform_handshake(ssl, conn).await
+            perform_handshake(ssl, conn, tls_capture).await
         };
 
         Box::pin(f)
@@ -137,8 +144,9 @@ where
                 return Ok(MaybeHttpsStream::Http(conn.io));
             }
 
+            let tls_capture = conn.req.tls_capture();
             let ssl = inner.setup_ssl2(conn.req)?;
-            perform_handshake(ssl, conn.io).await
+            perform_handshake(ssl, conn.io, tls_capture).await
         };
 
         Box::pin(fut)

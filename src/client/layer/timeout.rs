@@ -13,7 +13,7 @@ use tower::{Layer, Service};
 
 pub use self::body::TimeoutBody;
 use self::future::{ResponseBodyTimeoutFuture, ResponseFuture};
-use crate::{config::RequestConfig, error::BoxError};
+use crate::{config::RequestConfig, error::BoxError, tls::TlsCaptureSlot};
 
 /// Options for configuring timeouts.
 #[derive(Clone, Copy, Default)]
@@ -90,12 +90,24 @@ where
     }
 
     #[inline(always)]
-    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
         let (total_timeout, read_timeout) = fetch_timeout_options(&self.timeout, req.extensions());
+        let tls_capture = if total_timeout.is_some() || read_timeout.is_some() {
+            let capture = req
+                .extensions()
+                .get::<TlsCaptureSlot>()
+                .cloned()
+                .unwrap_or_default();
+            req.extensions_mut().insert(capture.clone());
+            Some(capture)
+        } else {
+            None
+        };
         ResponseFuture {
             response: self.inner.call(req),
             total_timeout: total_timeout.map(tokio::time::sleep),
             read_timeout: read_timeout.map(tokio::time::sleep),
+            tls_capture,
         }
     }
 }
