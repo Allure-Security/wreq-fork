@@ -1,88 +1,30 @@
-// Workaround for rustc 1.94.0 ICE in check_mod_deathness.
-#![allow(dead_code)]
+#![deny(unused)]
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
-#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(test, deny(warnings))]
-#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! # wreq
 //!
-//! An ergonomic all-in-one HTTP client for browser emulation with TLS, JA3/JA4, and HTTP/2
-//! fingerprints.
+//! An ergonomic and modular Rust HTTP Client for high-fidelity protocol matching, featuring
+//! customizable TLS, JA3/JA4, and HTTP/2 signature capabilities.
 //!
 //! - Plain bodies, [JSON](#json), [urlencoded](#forms), [multipart]
-//! - Cookies Store
+//! - HTTP Trailer
+//! - Cookie Store
 //! - [Redirect Policy](#redirect-policies)
 //! - Original Header
 //! - Rotating [Proxies](#proxies)
-//! - [Certificate Store](#certificate-store)
 //! - [Tower](https://docs.rs/tower/latest/tower) Middleware
 //! - [WebSocket](#websocket) Upgrade
 //! - HTTPS via [BoringSSL](#tls)
-//! - HTTP/2 over TLS [Emulation](#emulation)
+//! - HTTP/2 over TLS Parity
+//! - [Certificate Store (CAs & mTLS)](#certificate-store)
 //!
 //! Additional learning resources include:
 //!
 //! - [The Rust Cookbook](https://doc.rust-lang.org/stable/book/ch00-00-introduction.html)
 //! - [Repository Examples](https://github.com/0x676e67/wreq/tree/main/examples)
-//!
-//! ## Emulation
-//!
-//! The `emulation` module provides a way to simulate various browser TLS/HTTP2 fingerprints.
-//!
-//! ```rust,no_run
-//! use wreq_util::Emulation;
-//!
-//! #[tokio::main]
-//! async fn main() -> wreq::Result<()> {
-//!     // Use the API you're already familiar with
-//!     let resp = wreq::get("https://tls.peet.ws/api/all")
-//!         .emulation(Emulation::Firefox136)
-//!         .send().await?;
-//!     println!("{}", resp.text().await?);
-//!
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Websocket
-//!
-//! The `websocket` module provides a way to upgrade a connection to a websocket.
-//!
-//! ```rust,no_run
-//! use futures_util::{SinkExt, StreamExt, TryStreamExt};
-//! use wreq::{header, ws::message::Message};
-//!
-//! #[tokio::main]
-//! async fn main() -> wreq::Result<()> {
-//!     // Use the API you're already familiar with
-//!     let websocket = wreq::websocket("wss://echo.websocket.org")
-//!         .header(header::USER_AGENT, env!("CARGO_PKG_NAME"))
-//!         .send()
-//!         .await?;
-//!
-//!     assert_eq!(websocket.version(), http::Version::HTTP_11);
-//!
-//!     let (mut tx, mut rx) = websocket.into_websocket().await?.split();
-//!
-//!     tokio::spawn(async move {
-//!         for i in 1..11 {
-//!             if let Err(err) = tx.send(Message::text(format!("Hello, World! {i}"))).await {
-//!                 eprintln!("failed to send message: {err}");
-//!             }
-//!         }
-//!     });
-//!
-//!     while let Some(message) = rx.try_next().await? {
-//!         if let Message::Text(text) = message {
-//!             println!("received: {text}");
-//!         }
-//!     }
-//!
-//!     Ok(())
-//! }
-//! ```
 //!
 //! ## Making a GET request
 //!
@@ -180,6 +122,44 @@
 //! # }
 //! ```
 //!
+//! ## Websocket
+//!
+//! The `websocket` module provides a way to upgrade a connection to a websocket.
+//!
+//! ```rust,no_run
+//! use futures_util::{SinkExt, StreamExt, TryStreamExt};
+//! use wreq::{header, ws::message::Message};
+//!
+//! #[tokio::main]
+//! async fn main() -> wreq::Result<()> {
+//!     // Use the API you're already familiar with
+//!     let websocket = wreq::websocket("wss://echo.websocket.org")
+//!         .header(header::USER_AGENT, env!("CARGO_PKG_NAME"))
+//!         .send()
+//!         .await?;
+//!
+//!     assert_eq!(websocket.version(), http::Version::HTTP_11);
+//!
+//!     let (mut tx, mut rx) = websocket.into_websocket().await?.split();
+//!
+//!     tokio::spawn(async move {
+//!         for i in 1..11 {
+//!             if let Err(err) = tx.send(Message::text(format!("Hello, World! {i}"))).await {
+//!                 eprintln!("failed to send message: {err}");
+//!             }
+//!         }
+//!     });
+//!
+//!     while let Some(message) = rx.try_next().await? {
+//!         if let Message::Text(text) = message {
+//!             println!("received: {text}");
+//!         }
+//!     }
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
 //! ## Redirect Policies
 //!
 //! By default, the client does not handle HTTP redirects.
@@ -259,7 +239,7 @@
 //! - **webpki-roots** *(enabled by default)*: Use the webpki-roots crate for root certificates.
 //! - **system-proxy**: Enable system proxy support.
 //! - **tracing**: Enable tracing logging support.
-//! - **prefix-symbols**: Prefix BoringSSL symbols to avoid linker conflicts.
+//! - **prefix-symbols**: Prefix BoringSSL symbols to avoid OpenSSL conflicts.
 //!
 //! [client]: ./struct.Client.html
 //! [response]: ./struct.Response.html
@@ -270,16 +250,66 @@
 //! [Proxy]: ./struct.Proxy.html
 //! [cargo-features]: https://doc.rust-lang.org/stable/cargo/reference/manifest.html#the-features-section
 
+macro_rules! if_tokio_rt {
+    (block: { $($tt:tt)* }) => {
+        #[cfg(all(feature = "tokio-rt", not(feature = "compio-rt")))]
+        $($tt)*
+    };
+    ($($item:item)*) => {$(
+        #[cfg(all(feature = "tokio-rt", not(feature = "compio-rt")))]
+        $item
+    )*};
+}
+
+macro_rules! if_compio_rt {
+    (block: { $($tt:tt)* }) => {
+        #[cfg(all(feature = "compio-rt", not(feature = "tokio-rt")))]
+        $($tt)*
+    };
+    ($($item:item)*) => {$(
+        #[cfg(all(feature = "compio-rt", not(feature = "tokio-rt")))]
+        $item
+    )*};
+}
+
+macro_rules! if_all_rt {
+    (block: { $($tt:tt)* }) => {
+        #[cfg(all(feature = "tokio-rt", feature = "compio-rt"))]
+        $($tt)*
+    };
+    ($($item:item)*) => {$(
+        #[cfg(all(feature = "tokio-rt", feature = "compio-rt"))]
+        $item
+    )*};
+}
+
+macro_rules! if_any_rt {
+    ($($item:item)*) => {$(
+        #[cfg(any(feature = "tokio-rt", feature = "compio-rt"))]
+        $item
+    )*};
+}
+
+macro_rules! if_no_rt {
+    (block: { $($tt:tt)* }) => {
+        #[cfg(not(any(feature = "tokio-rt", feature = "compio-rt")))]
+        $($tt)*
+    };
+}
+
 #[macro_use]
 mod trace;
 #[macro_use]
+mod ext;
+#[macro_use]
 mod config;
 mod client;
+mod conn;
 mod error;
-mod ext;
-mod hash;
+mod group;
 mod into_uri;
 mod proxy;
+mod rt;
 mod sync;
 mod util;
 
@@ -291,24 +321,45 @@ pub mod redirect;
 pub mod retry;
 pub mod tls;
 
-pub use http::{Method, StatusCode, Uri, Version};
-#[cfg(unix)]
-use libc as _;
-
 #[cfg(feature = "multipart")]
 pub use self::client::multipart;
 #[cfg(feature = "ws")]
 pub use self::client::ws;
 pub use self::{
     client::{
-        Body, Client, ClientBuilder, Emulation, EmulationBuilder, EmulationFactory, Request,
-        RequestBuilder, Response, Upgraded, http1, http2,
+        Client, ClientBuilder,
+        body::Body,
+        emulate::{Emulation, EmulationBuilder, IntoEmulation},
+        request::{Request, RequestBuilder},
+        response::Response,
+        upgrade::Upgraded,
     },
     error::{Error, Result},
     ext::{ResponseBuilderExt, ResponseExt},
+    group::Group,
     into_uri::IntoUri,
     proxy::{NoProxy, Proxy},
 };
+
+pub mod http1 {
+    //! HTTP/1 protocol implementation and utilities.
+
+    pub use wreq_proto::http1::{Http1Options, Http1OptionsBuilder};
+}
+
+pub mod http2 {
+    //! HTTP/2 protocol implementation and utilities.
+
+    pub use http2::frame::{
+        Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, Setting, SettingId,
+        SettingsOrder, SettingsOrderBuilder, StreamDependency, StreamId,
+    };
+    pub use wreq_proto::http2::{Http2Options, Http2OptionsBuilder};
+}
+
+pub use http::{Method, StatusCode, Uri, Version};
+#[cfg(unix)]
+use libc as _;
 
 fn _assert_impls() {
     fn assert_send<T: Send>() {}

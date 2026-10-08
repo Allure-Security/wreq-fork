@@ -13,6 +13,7 @@ use std::{
     task::{Context, Poll, ready},
 };
 
+use bytes::Bytes;
 use futures_util::{Sink, SinkExt, Stream, StreamExt, stream::FusedStream};
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version, header, uri::Scheme,
@@ -25,10 +26,8 @@ use tokio_tungstenite::tungstenite::{
 };
 
 use self::message::{CloseCode, Message, Utf8Bytes};
-use crate::{
-    EmulationFactory, Error, RequestBuilder, Response, Upgraded, header::OrigHeaderMap,
-    proxy::Proxy,
-};
+use super::{emulate::IntoEmulation, request::RequestBuilder, response::Response};
+use crate::{Error, Upgraded, header::OrigHeaderMap, proxy::Proxy};
 
 /// A WebSocket stream.
 type WebSocketStream = tokio_tungstenite::WebSocketStream<Upgraded>;
@@ -73,20 +72,27 @@ impl WebSocketRequestBuilder {
         self
     }
 
-    /// Forces the WebSocket connection to use HTTP/2 protocol.
+    /// Set HTTP version
     ///
-    /// This method configures the WebSocket connection to use HTTP/2's Extended
-    /// CONNECT Protocol (RFC 8441) for the handshake instead of the traditional
-    /// HTTP/1.1 upgrade mechanism.
+    /// Configures the HTTP version used for the WebSocket handshake.
+    /// Defaults to HTTP/1.1.
     ///
-    /// # Behavior
+    /// # HTTP/1.1 (default)
     ///
-    /// - Uses `CONNECT` method with `:protocol: websocket` pseudo-header
-    /// - Requires server support for HTTP/2 WebSocket connections
-    /// - Will fail if server doesn't support HTTP/2 WebSocket upgrade
+    /// - Uses the standard `Upgrade: websocket` mechanism (RFC 6455)
+    /// - Sends an HTTP `GET` request with `Connection: Upgrade` and `Upgrade: websocket` headers
+    /// - Widely supported by servers
+    ///
+    /// # HTTP/2
+    ///
+    /// - Uses the Extended CONNECT Protocol (RFC 8441)
+    /// - Sends a `CONNECT` request with the `:protocol: websocket` pseudo-header instead of the
+    ///   traditional upgrade mechanism
+    /// - Requires explicit server support for HTTP/2 WebSocket connections
+    /// - Will fail if the server does not support HTTP/2 WebSocket upgrade
     #[inline]
-    pub fn force_http2(mut self) -> Self {
-        self.inner = self.inner.version(Version::HTTP_2);
+    pub fn version(mut self, version: Version) -> Self {
+        self.inner = self.inner.version(version);
         self
     }
 
@@ -315,8 +321,38 @@ impl WebSocketRequestBuilder {
         self
     }
 
-    /// Set the interface for this request.
-    #[inline]
+    /// Bind connections only on the specified network interface.
+    ///
+    /// This option is only available on the following operating systems:
+    ///
+    /// - Android
+    /// - Fuchsia
+    /// - Linux,
+    /// - macOS and macOS-like systems (iOS, tvOS, watchOS and visionOS)
+    /// - Solaris and illumos
+    ///
+    /// On Android, Linux, and Fuchsia, this uses the
+    /// [`SO_BINDTODEVICE`][man-7-socket] socket option. On macOS and macOS-like
+    /// systems, Solaris, and illumos, this instead uses the [`IP_BOUND_IF` and
+    /// `IPV6_BOUND_IF`][man-7p-ip] socket options (as appropriate).
+    ///
+    /// Note that connections will fail if the provided interface name is not a
+    /// network interface that currently exists when a connection is established.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # fn doc() -> Result<(), wreq::Error> {
+    /// let interface = "lo";
+    /// let client = wreq::Client::builder()
+    ///     .interface(interface)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [man-7-socket]: https://man7.org/linux/man-pages/man7/socket.7.html
+    /// [man-7p-ip]: https://docs.oracle.com/cd/E86824_01/html/E54777/ip-7p.html
     #[cfg(any(
         target_os = "android",
         target_os = "fuchsia",
@@ -352,13 +388,19 @@ impl WebSocketRequestBuilder {
         self
     }
 
-    /// Set the emulation for this request.
+    /// Sets the request builder to emulation the specified HTTP context.
+    ///
+    /// This method sets the necessary headers, HTTP/1 and HTTP/2 options configurations, and  TLS
+    /// options config to use the specified HTTP context. It allows the client to mimic the
+    /// behavior of different versions or setups, which can be useful for testing or ensuring
+    /// compatibility with various environments.
+    ///
+    /// # Note
+    /// This will overwrite the existing configuration.
+    /// You must set emulation before you can perform subsequent HTTP1/HTTP2/TLS fine-tuning.
     #[inline]
-    pub fn emulation<P>(mut self, factory: P) -> Self
-    where
-        P: EmulationFactory,
-    {
-        self.inner = self.inner.emulation(factory);
+    pub fn emulation<T: IntoEmulation>(mut self, emulation: T) -> Self {
+        self.inner = self.inner.emulation(emulation);
         self
     }
 
@@ -436,7 +478,8 @@ impl WebSocketRequestBuilder {
 
                 request.headers_mut().insert(
                     header::SEC_WEBSOCKET_PROTOCOL,
-                    subprotocols.parse().map_err(Error::builder)?,
+                    HeaderValue::from_maybe_shared(Bytes::from(subprotocols))
+                        .map_err(Error::builder)?,
                 );
             }
         }
@@ -561,9 +604,8 @@ impl WebSocketResponse {
                 (None, None) => {}
             };
 
-            let upgraded = self.inner.upgrade().await?;
             let inner = WebSocketStream::from_raw_socket(
-                upgraded,
+                self.inner.upgrade().await?,
                 protocol::Role::Client,
                 Some(self.config),
             )
@@ -632,6 +674,12 @@ impl WebSocket {
             .send(msg.into_tungstenite())
             .await
             .map_err(Error::websocket)
+    }
+
+    /// Consumes the [`WebSocket`] and returns the underlying stream.
+    #[inline]
+    pub fn into_inner(self) -> Upgraded {
+        self.inner.into_inner()
     }
 
     /// Closes the connection with a given code and (optional) reason.

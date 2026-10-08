@@ -9,39 +9,40 @@ use futures_util::future::Either;
 use http::{
     HeaderMap, Method, Request, Response, StatusCode, Uri,
     header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, TRANSFER_ENCODING},
-    request::Parts,
 };
-use http_body::Body;
 use pin_project_lite::pin_project;
-use tower::{Service, util::Oneshot};
+use tower::{BoxError, Service, util::Oneshot};
 use url::Url;
 
-use super::{Action, Attempt, BodyRepr, Policy};
-use crate::{Error, error::BoxError, ext::RequestUri, into_uri::IntoUriSealed};
+use super::{
+    BodyRepr,
+    policy::{Action, Attempt},
+};
+use crate::{Body, ext::RequestUri, into_uri::IntoUriSealed, redirect::FollowRedirectPolicy};
 
 /// Pending future state for handling redirects.
-pub struct Pending<ReqBody, Response> {
+pub struct Pending<Response> {
     future: Pin<Box<dyn Future<Output = Action> + Send>>,
     location: Uri,
-    body: ReqBody,
+    body: Body,
     res: Response,
 }
 
 pin_project! {
     /// Response future for [`FollowRedirect`].
     #[project = ResponseFutureProj]
-    pub enum ResponseFuture<S, B, P>
+    pub enum ResponseFuture<S>
     where
-        S: Service<Request<B>>,
+        S: Service<Request<Body>>,
     {
         Redirect {
             #[pin]
-            future: Either<S::Future, Oneshot<S, Request<B>>>,
-            pending_future: Option<Pending<B, S::Response>>,
+            future: Either<S::Future, Oneshot<S, Request<Body>>>,
+            pending_future: Option<Pending<S::Response>>,
             service: S,
-            policy: P,
-            parts: Parts,
-            body_repr: BodyRepr<B>,
+            policy: FollowRedirectPolicy,
+            request: Request<()>,
+            body_repr: BodyRepr<Body>,
         },
 
         Direct {
@@ -51,14 +52,12 @@ pin_project! {
     }
 }
 
-impl<S, ReqBody, ResBody, P> Future for ResponseFuture<S, ReqBody, P>
+impl<S, B> Future for ResponseFuture<S>
 where
-    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone,
+    S: Service<Request<Body>, Response = Response<B>> + Clone,
     S::Error: From<BoxError>,
-    P: Policy<ReqBody, S::Error>,
-    ReqBody: Body + Default,
 {
-    type Output = Result<Response<ResBody>, S::Error>;
+    type Output = Result<Response<B>, S::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project() {
@@ -68,7 +67,7 @@ where
                 pending_future,
                 service,
                 policy,
-                parts,
+                request,
                 body_repr,
             } => {
                 // Check if we have a pending action to resolve
@@ -88,7 +87,7 @@ where
                             future: &mut future,
                             service,
                             policy,
-                            parts,
+                            request,
                             body: state.body,
                             body_repr,
                             res: state.res,
@@ -100,7 +99,8 @@ where
                 // Poll the current future to get the response
                 let mut res = {
                     let mut res = ready!(future.as_mut().poll(cx)?);
-                    res.extensions_mut().insert(RequestUri(parts.uri.clone()));
+                    res.extensions_mut()
+                        .insert(RequestUri(request.uri().clone()));
                     res
                 };
 
@@ -109,19 +109,19 @@ where
                     StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND => {
                         // User agents MAY change the request method from POST to GET
                         // (RFC 7231 section 6.4.2. and 6.4.3.).
-                        if parts.method == Method::POST {
-                            parts.method = Method::GET;
+                        if request.method() == Method::POST {
+                            *request.method_mut() = Method::GET;
                             *body_repr = BodyRepr::Empty;
-                            drop_payload_headers(&mut parts.headers);
+                            drop_payload_headers(request.headers_mut());
                         }
                     }
                     StatusCode::SEE_OTHER => {
                         // A user agent can perform a GET or HEAD request (RFC 7231 section 6.4.4.).
-                        if parts.method != Method::HEAD {
-                            parts.method = Method::GET;
+                        if request.method() != Method::HEAD {
+                            *request.method_mut() = Method::GET;
                         }
                         *body_repr = BodyRepr::Empty;
-                        drop_payload_headers(&mut parts.headers);
+                        drop_payload_headers(request.headers_mut());
                     }
                     StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT => {}
                     _ => {
@@ -141,7 +141,7 @@ where
                     .headers()
                     .get(LOCATION)
                     .and_then(|loc| loc.to_str().ok())
-                    .and_then(|loc| resolve_uri(loc, &parts.uri))
+                    .and_then(|loc| resolve_uri(loc, request.uri()))
                 else {
                     return Poll::Ready(Ok(res));
                 };
@@ -151,7 +151,7 @@ where
                     status: res.status(),
                     headers: res.headers(),
                     location: &location,
-                    previous: &parts.uri,
+                    previous: request.uri(),
                 };
 
                 // Resolve the action, awaiting if it's pending
@@ -177,7 +177,7 @@ where
                         future: &mut future,
                         service,
                         policy,
-                        parts,
+                        request,
                         body,
                         body_repr,
                         res,
@@ -212,59 +212,48 @@ fn drop_payload_headers(headers: &mut HeaderMap) {
     }
 }
 
-type RedirectFuturePin<'a, S, ReqBody> =
-    Pin<&'a mut Either<<S as Service<Request<ReqBody>>>::Future, Oneshot<S, Request<ReqBody>>>>;
+type RedirectFuturePin<'a, S> =
+    Pin<&'a mut Either<<S as Service<Request<Body>>>::Future, Oneshot<S, Request<Body>>>>;
 
-struct RedirectAction<'a, S, ReqBody, ResBody, P>
+struct RedirectAction<'a, S, B>
 where
-    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone,
-    P: Policy<ReqBody, S::Error>,
+    S: Service<Request<Body>, Response = Response<B>> + Clone,
 {
     action: Action,
-    future: &'a mut RedirectFuturePin<'a, S, ReqBody>,
+    future: &'a mut RedirectFuturePin<'a, S>,
     service: &'a S,
-    policy: &'a mut P,
-    parts: &'a mut Parts,
-    body: ReqBody,
-    body_repr: &'a mut BodyRepr<ReqBody>,
-    res: Response<ResBody>,
+    policy: &'a mut FollowRedirectPolicy,
+    request: &'a mut Request<()>,
+    body: Body,
+    body_repr: &'a mut BodyRepr<Body>,
+    res: Response<B>,
     location: Uri,
 }
 
-fn handle_action<S, ReqBody, ResBody, P>(
+fn handle_action<S, B>(
     cx: &mut Context<'_>,
-    redirect: RedirectAction<'_, S, ReqBody, ResBody, P>,
-) -> Poll<Result<Response<ResBody>, S::Error>>
+    redirect: RedirectAction<'_, S, B>,
+) -> Poll<Result<Response<B>, S::Error>>
 where
-    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone,
+    S: Service<Request<Body>, Response = Response<B>> + Clone,
     S::Error: From<BoxError>,
-    P: Policy<ReqBody, S::Error>,
-    ReqBody: Body + Default,
 {
     match redirect.action {
         Action::Follow => {
-            redirect.parts.uri = redirect.location;
-            redirect
-                .body_repr
-                .try_clone_from(&redirect.body, redirect.policy);
+            *redirect.request.uri_mut() = redirect.location;
+            redirect.body_repr.try_clone_from(&redirect.body);
+            redirect.policy.on_request(redirect.request);
 
-            let mut req = Request::from_parts(redirect.parts.clone(), redirect.body);
-            redirect.policy.on_request(&mut req);
-            redirect
-                .future
-                .set(Either::Right(Oneshot::new(redirect.service.clone(), req)));
+            redirect.future.set(Either::Right(Oneshot::new(
+                redirect.service.clone(),
+                redirect.request.clone().map(|_| redirect.body),
+            )));
 
             cx.waker().wake_by_ref();
             Poll::Pending
         }
         Action::Stop => Poll::Ready(Ok(redirect.res)),
-        Action::Pending(_) => Poll::Ready(Err(S::Error::from(
-            Error::redirect(
-                "Nested pending Action is not supported in redirect policy",
-                redirect.parts.uri.clone(),
-            )
-            .into(),
-        ))),
         Action::Error(err) => Poll::Ready(Err(err.into())),
+        Action::Pending(_) => unreachable!(),
     }
 }

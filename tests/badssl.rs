@@ -1,8 +1,8 @@
-use std::time::Duration;
+use std::{error::Error as StdError, io, time::Duration};
 
 use wreq::{
-    Client,
-    tls::{AlpsProtocol, CertStore, TlsInfo, TlsOptions, TlsVersion},
+    Client, retry,
+    tls::{AlpsProtocol, TlsInfo, TlsOptions, TlsVersion, trust::CertStore},
 };
 
 macro_rules! join {
@@ -11,11 +11,40 @@ macro_rules! join {
     };
 }
 
+fn badssl_connection_reset_retry_policy() -> retry::Policy {
+    retry::Policy::default()
+        .max_retries_per_request(10)
+        .no_budget()
+        .classify_fn(|req_rep| {
+            if req_rep.error().is_some_and(is_connection_reset) {
+                req_rep.retryable()
+            } else {
+                req_rep.success()
+            }
+        })
+}
+
+fn is_connection_reset(err: &(dyn StdError + 'static)) -> bool {
+    let mut source = Some(err);
+
+    while let Some(err) = source {
+        if let Some(io) = err.downcast_ref::<io::Error>()
+            && io.kind() == io::ErrorKind::ConnectionReset
+        {
+            return true;
+        }
+
+        source = err.source();
+    }
+
+    false
+}
+
 #[tokio::test]
 async fn test_badssl_modern() {
     let text = Client::builder()
         .no_proxy()
-        .connect_timeout(Duration::from_secs(360))
+        .retry(badssl_connection_reset_retry_policy())
         .build()
         .unwrap()
         .get("https://mozilla-modern.badssl.com/")
@@ -26,15 +55,15 @@ async fn test_badssl_modern() {
         .await
         .unwrap();
 
-    assert!(!text.is_empty());
+    assert!(text.contains("<title>mozilla-modern.badssl.com</title>"));
 }
 
 #[tokio::test]
 async fn test_badssl_self_signed() {
     let text = Client::builder()
-        .cert_verification(false)
-        .connect_timeout(Duration::from_secs(360))
+        .tls_cert_verification(false)
         .no_proxy()
+        .retry(badssl_connection_reset_retry_policy())
         .build()
         .unwrap()
         .get("https://self-signed.badssl.com/")
@@ -45,8 +74,39 @@ async fn test_badssl_self_signed() {
         .await
         .unwrap();
 
-    assert!(!text.is_empty());
+    assert!(text.contains("<title>self-signed.badssl.com</title>"));
 }
+
+#[tokio::test]
+async fn test_badssl_wrong_host() {
+    let text = Client::builder()
+        .tls_verify_hostname(false)
+        .no_proxy()
+        .retry(badssl_connection_reset_retry_policy())
+        .build()
+        .unwrap()
+        .get("https://wrong.host.badssl.com/")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(text.contains("<title>wrong.host.badssl.com</title>"));
+
+    let result = Client::builder()
+        .tls_verify_hostname(false)
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get("https://self-signed.badssl.com/")
+        .send()
+        .await;
+
+    assert!(result.is_err());
+}
+
 const CURVES_LIST: &str = join!(
     ":",
     "X25519",
@@ -70,8 +130,9 @@ async fn test_3des_support() -> wreq::Result<()> {
 
     // Create a client with the TLS options
     let client = Client::builder()
-        .emulation(tls_options)
-        .cert_verification(false)
+        .tls_options(tls_options)
+        .tls_cert_verification(false)
+        .retry(badssl_connection_reset_retry_policy())
         .connect_timeout(Duration::from_secs(360))
         .build()?;
 
@@ -103,8 +164,9 @@ async fn test_firefox_7x_100_cipher() -> wreq::Result<()> {
 
     // Create a client with the TLS options
     let client = Client::builder()
-        .emulation(tls_options)
-        .cert_verification(false)
+        .tls_options(tls_options)
+        .tls_cert_verification(false)
+        .retry(badssl_connection_reset_retry_policy())
         .connect_timeout(Duration::from_secs(360))
         .build()?;
 
@@ -131,7 +193,7 @@ async fn test_alps_new_endpoint() -> wreq::Result<()> {
         .build();
 
     let client = Client::builder()
-        .emulation(tls_options)
+        .tls_options(tls_options)
         .connect_timeout(Duration::from_secs(360))
         .build()?;
 
@@ -174,7 +236,7 @@ async fn test_aes_hw_override() -> wreq::Result<()> {
 
     // Create a client with the TLS options
     let client = Client::builder()
-        .emulation(tls_options)
+        .tls_options(tls_options)
         .connect_timeout(Duration::from_secs(360))
         .build()?;
 
@@ -188,9 +250,10 @@ async fn test_aes_hw_override() -> wreq::Result<()> {
 #[tokio::test]
 async fn test_tls_self_signed_cert() {
     let client = Client::builder()
-        .cert_verification(false)
-        .connect_timeout(Duration::from_secs(360))
+        .tls_cert_verification(false)
         .tls_info(true)
+        .retry(badssl_connection_reset_retry_policy())
+        .no_proxy()
         .build()
         .unwrap();
 
@@ -212,7 +275,9 @@ async fn test_tls_self_signed_cert() {
         .unwrap();
 
     let client = Client::builder()
-        .cert_store(self_signed_cert_store)
+        .tls_cert_store(self_signed_cert_store)
+        .retry(badssl_connection_reset_retry_policy())
+        .no_proxy()
         .build()
         .unwrap();
 

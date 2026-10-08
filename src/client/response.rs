@@ -16,14 +16,16 @@ use http_body_util::{BodyExt, Collected};
 use mime::Mime;
 #[cfg(feature = "json")]
 use serde::de::DeserializeOwned;
+use wreq_proto::ext::ReasonPhrase;
 
-use super::{
-    conn::HttpInfo,
-    core::{ext::ReasonPhrase, upgrade},
-};
 #[cfg(feature = "cookies")]
 use crate::cookie;
-use crate::{Body, Error, Upgraded, error::BoxError, ext::RequestUri};
+use crate::{
+    Body, Error,
+    conn::{Connected, http::HttpInfo},
+    error::BoxError,
+    ext::RequestUri,
+};
 
 /// A Response to a submitted [`crate::Request`].
 #[derive(Debug)]
@@ -33,14 +35,18 @@ pub struct Response {
 }
 
 impl Response {
-    pub(super) fn new<B>(res: http::Response<B>, uri: Uri) -> Response
+    #[inline]
+    pub(super) fn new<B>(mut res: http::Response<B>, uri: Uri) -> Response
     where
         B: HttpBody + Send + Sync + 'static,
         B::Data: Into<Bytes>,
         B::Error: Into<BoxError>,
     {
         Response {
-            uri,
+            uri: res
+                .extensions_mut()
+                .remove::<RequestUri>()
+                .map_or(uri, |request_uri| request_uri.0),
             res: res.map(Body::wrap),
         }
     }
@@ -269,8 +275,15 @@ impl Response {
     #[cfg(feature = "json")]
     #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
     pub async fn json<T: DeserializeOwned>(self) -> crate::Result<T> {
-        let full = self.bytes().await?;
-        serde_json::from_slice(&full).map_err(Error::decode)
+        match http_body_util::BodyExt::collect(self.res.into_body())
+            .await
+            .map(Collected::<Bytes>::to_bytes)
+        {
+            Ok(full) => serde_json::from_slice(&full)
+                .map_err(Error::decode)
+                .map_err(|err| err.with_uri(self.uri)),
+            Err(err) => Err(err.with_uri(self.uri)),
+        }
     }
 
     /// Get the full response body as [`Bytes`].
@@ -290,38 +303,12 @@ impl Response {
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     pub async fn bytes(self) -> crate::Result<Bytes> {
         BodyExt::collect(self.res.into_body())
             .await
             .map(Collected::<Bytes>::to_bytes)
-    }
-
-    /// Stream a chunk of the response body.
-    ///
-    /// When the response body has been exhausted, this will return `None`.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut res = wreq::get("https://hyper.rs").send().await?;
-    ///
-    /// while let Some(chunk) = res.chunk().await? {
-    ///     println!("Chunk: {chunk:?}");
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn chunk(&mut self) -> crate::Result<Option<Bytes>> {
-        loop {
-            if let Some(res) = self.res.body_mut().frame().await {
-                if let Ok(buf) = res?.into_data() {
-                    return Ok(Some(buf));
-                }
-            } else {
-                return Ok(None);
-            }
-        }
+            .map_err(|err| err.with_uri(self.uri))
     }
 
     /// Convert the response into a [`Stream`] of [`Bytes`] from the body.
@@ -348,6 +335,7 @@ impl Response {
     /// # Optional
     ///
     /// This requires the optional `stream` feature to be enabled.
+    #[inline]
     #[cfg(feature = "stream")]
     #[cfg_attr(docsrs, doc(cfg(feature = "stream")))]
     pub fn bytes_stream(self) -> impl Stream<Item = crate::Result<Bytes>> {
@@ -414,6 +402,23 @@ impl Response {
         self.res.extensions_mut()
     }
 
+    /// Forbids the [`Response`] connection from being recycled back into the pool.
+    ///
+    /// This marks the underlying connection as "poisoned." Once marked, the connection
+    /// will be discarded instead of reused after the current request-response cycle completes.
+    ///
+    /// # Note on Lifecycle
+    /// Marking the connection does not trigger an immediate shutdown. For pooled
+    /// connections, the physical closure is deferred until the `Response` body
+    /// is dropped or the pool's background cleaner reclaims the resource.
+    #[inline]
+    pub fn forbid_recycle(&self) {
+        self.res
+            .extensions()
+            .get::<Connected>()
+            .map(Connected::poison);
+    }
+
     // util methods
 
     /// Turn a response into an error if the server returned an error.
@@ -471,11 +476,6 @@ impl Response {
             Ok(self)
         }
     }
-
-    /// Consumes the [`Response`] and returns a future for a possible HTTP upgrade.
-    pub async fn upgrade(self) -> crate::Result<Upgraded> {
-        upgrade::on(self.res).await.map_err(Error::upgrade)
-    }
 }
 
 /// I'm not sure this conversion is that useful... People should be encouraged
@@ -503,6 +503,7 @@ impl From<Response> for http::Response<Body> {
 
 /// A [`Response`] can be piped as the [`Body`] of another request.
 impl From<Response> for Body {
+    #[inline]
     fn from(r: Response) -> Body {
         Body::wrap(r.res.into_body())
     }
@@ -514,7 +515,7 @@ impl HttpBody for Response {
 
     type Error = Error;
 
-    #[inline]
+    #[inline(always)]
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -522,12 +523,12 @@ impl HttpBody for Response {
         Pin::new(self.res.body_mut()).poll_frame(cx)
     }
 
-    #[inline]
+    #[inline(always)]
     fn is_end_stream(&self) -> bool {
         self.res.body().is_end_stream()
     }
 
-    #[inline]
+    #[inline(always)]
     fn size_hint(&self) -> http_body::SizeHint {
         self.res.body().size_hint()
     }

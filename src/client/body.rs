@@ -5,16 +5,14 @@ use std::{
 
 use bytes::Bytes;
 use http_body::{Body as HttpBody, SizeHint};
-use http_body_util::{BodyExt, Either, combinators::BoxBody};
+use http_body_util::{BodyExt, Either, Full, combinators::BoxBody};
 use pin_project_lite::pin_project;
-#[cfg(feature = "stream")]
-use {tokio::fs::File, tokio_util::io::ReaderStream};
 
 use crate::error::{BoxError, Error};
 
 /// An request body.
 #[derive(Debug)]
-pub struct Body(Either<Bytes, BoxBody<Bytes, BoxError>>);
+pub struct Body(Either<Full<Bytes>, BoxBody<Bytes, BoxError>>);
 
 pin_project! {
     /// We can't use `map_frame()` because that loses the hint data (for good reason).
@@ -28,16 +26,6 @@ pin_project! {
 // ===== impl Body =====
 
 impl Body {
-    /// Returns a reference to the internal data of the `Body`.
-    ///
-    /// `None` is returned, if the underlying data is a stream.
-    pub fn as_bytes(&self) -> Option<&[u8]> {
-        match &self.0 {
-            Either::Left(bytes) => Some(bytes.as_ref()),
-            Either::Right(..) => None,
-        }
-    }
-
     /// Wrap a [`HttpBody`] in a box inside `Body`.
     ///
     /// # Example
@@ -120,20 +108,19 @@ impl Body {
 
     #[inline]
     pub(crate) fn reusable(chunk: Bytes) -> Body {
-        Body(Either::Left(chunk))
+        Body(Either::Left(Full::new(chunk)))
     }
 
+    #[inline]
     #[cfg(feature = "multipart")]
     pub(crate) fn content_length(&self) -> Option<u64> {
-        match self.0 {
-            Either::Left(ref bytes) => Some(bytes.len() as u64),
-            Either::Right(ref body) => body.size_hint().exact(),
-        }
+        self.0.size_hint().exact()
     }
 
+    #[inline]
     pub(crate) fn try_clone(&self) -> Option<Body> {
         match self.0 {
-            Either::Left(ref chunk) => Some(Body::reusable(chunk.clone())),
+            Either::Left(ref chunk) => Some(Body(Either::Left(chunk.clone()))),
             Either::Right { .. } => None,
         }
     }
@@ -188,11 +175,11 @@ impl From<&'static str> for Body {
     }
 }
 
-#[cfg(feature = "stream")]
-impl From<File> for Body {
+#[cfg(all(feature = "tokio-rt", feature = "stream"))]
+impl From<tokio::fs::File> for Body {
     #[inline]
-    fn from(file: File) -> Body {
-        Body::wrap_stream(ReaderStream::new(file))
+    fn from(file: tokio::fs::File) -> Body {
+        Body::wrap_stream(tokio_util::io::ReaderStream::new(file))
     }
 }
 
@@ -200,44 +187,25 @@ impl HttpBody for Body {
     type Data = Bytes;
     type Error = Error;
 
+    #[inline(always)]
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        match self.0 {
-            Either::Left(ref mut bytes) => {
-                let out = bytes.split_off(0);
-                if out.is_empty() {
-                    Poll::Ready(None)
-                } else {
-                    Poll::Ready(Some(Ok(http_body::Frame::data(out))))
-                }
-            }
-            Either::Right(ref mut body) => {
-                Poll::Ready(ready!(Pin::new(body).poll_frame(cx)).map(|opt_chunk| {
-                    opt_chunk.map_err(|err| match err.downcast::<Error>() {
-                        Ok(err) => *err,
-                        Err(err) => Error::body(err),
-                    })
-                }))
-            }
-        }
+        Pin::new(&mut self.0).poll_frame(cx).map_err(|err| {
+            err.downcast::<Error>()
+                .map_or_else(Error::request, |err| *err)
+        })
     }
 
-    #[inline]
+    #[inline(always)]
     fn size_hint(&self) -> SizeHint {
-        match self.0 {
-            Either::Left(ref bytes) => SizeHint::with_exact(bytes.len() as u64),
-            Either::Right(ref body) => body.size_hint(),
-        }
+        self.0.size_hint()
     }
 
-    #[inline]
+    #[inline(always)]
     fn is_end_stream(&self) -> bool {
-        match self.0 {
-            Either::Left(ref bytes) => bytes.is_empty(),
-            Either::Right(ref body) => body.is_end_stream(),
-        }
+        self.0.is_end_stream()
     }
 }
 
@@ -251,6 +219,7 @@ where
     type Data = Bytes;
     type Error = B::Error;
 
+    #[inline(always)]
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -262,12 +231,12 @@ where
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
     }
 
-    #[inline]
+    #[inline(always)]
     fn is_end_stream(&self) -> bool {
         self.inner.is_end_stream()
     }
@@ -278,13 +247,6 @@ mod tests {
     use http_body::Body as _;
 
     use super::Body;
-
-    #[test]
-    fn test_as_bytes() {
-        let test_data = b"Test body";
-        let body = Body::from(&test_data[..]);
-        assert_eq!(body.as_bytes(), Some(&test_data[..]));
-    }
 
     #[test]
     fn body_exact_length() {

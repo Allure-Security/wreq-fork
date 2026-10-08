@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use wreq::{
     Client,
-    tls::{CertStore, TlsInfo},
+    tls::{TlsInfo, trust::CertStore},
 };
 
 /// Certificate Store Example
@@ -39,7 +39,7 @@ use wreq::{
 async fn main() -> wreq::Result<()> {
     // Create a client with a custom certificate store using webpki-roots
     let client = Client::builder()
-        .cert_store(CertStore::from_der_certs(
+        .tls_cert_store(CertStore::from_der_certs(
             webpki_root_certs::TLS_SERVER_ROOT_CERTS,
         )?)
         .build()?;
@@ -51,26 +51,26 @@ async fn main() -> wreq::Result<()> {
     // Skip certificate verification for self-signed certificates
     let client = Client::builder()
         .tls_info(true)
-        .cert_verification(false)
+        .tls_cert_verification(false)
         .build()?;
 
     // Use the API you're already familiar with
     let resp = client.get("https://self-signed.badssl.com/").send().await?;
-    if let Some(tls_info) = resp.extensions().get::<TlsInfo>() {
-        if let Some(peer_cert_der) = tls_info.peer_certificate() {
-            // Create self-signed certificate Store
-            let self_signed_store = CertStore::from_der_certs(&[peer_cert_der])?;
+    if let Some(tls_info) = resp.extensions().get::<TlsInfo>()
+        && let Some(peer_cert_der) = tls_info.peer_certificate()
+    {
+        // Create self-signed certificate Store
+        let self_signed_store = CertStore::from_der_certs([peer_cert_der])?;
 
-            // Create a client with self-signed certificate store
-            let client = Client::builder()
-                .cert_store(self_signed_store)
-                .connect_timeout(Duration::from_secs(10))
-                .build()?;
+        // Create a client with self-signed certificate store
+        let client = Client::builder()
+            .tls_cert_store(self_signed_store)
+            .connect_timeout(Duration::from_secs(10))
+            .build()?;
 
-            // Use the API you're already familiar with
-            let resp = client.get("https://self-signed.badssl.com/").send().await?;
-            println!("{}", resp.text().await?);
-        }
+        // Use the API you're already familiar with
+        let resp = client.get("https://self-signed.badssl.com/").send().await?;
+        println!("{}", resp.text().await?);
     }
 
     Ok(())

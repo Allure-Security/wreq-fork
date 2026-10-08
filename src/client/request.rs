@@ -6,16 +6,13 @@ use std::{
     time::Duration,
 };
 
-use http::{Extensions, Request as HttpRequest, Uri, Version};
+#[cfg(any(feature = "form", feature = "json", feature = "multipart"))]
+use http::header::CONTENT_TYPE;
+use http::{Extensions, Uri, Version};
 #[cfg(any(feature = "query", feature = "form", feature = "json"))]
 use serde::Serialize;
 #[cfg(feature = "multipart")]
 use {super::multipart, bytes::Bytes, http::header::CONTENT_LENGTH};
-#[cfg(feature = "cookies")]
-use {
-    crate::cookie::{CookieStore, IntoCookieStore},
-    std::sync::Arc,
-};
 
 #[cfg(any(
     feature = "gzip",
@@ -25,19 +22,20 @@ use {
 ))]
 use super::layer::decoder::AcceptEncoding;
 use super::{
-    Body, EmulationFactory, Response,
-    http::{Client, future::Pending},
+    Body, Client, IntoEmulation, Response,
+    future::Pending,
     layer::{
         config::{DefaultHeaders, RequestOptions},
         timeout::TimeoutOptions,
     },
 };
-#[cfg(any(feature = "multipart", feature = "form", feature = "json"))]
-use crate::header::CONTENT_TYPE;
+#[cfg(feature = "cookies")]
+use crate::cookie::{CookieStore, IntoCookieStore};
 use crate::{
     Error, Method, Proxy,
     config::{RequestConfig, RequestConfigValue},
     ext::UriExt,
+    group::Group,
     header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, OrigHeaderMap},
     redirect,
 };
@@ -116,15 +114,49 @@ impl Request {
     #[inline]
     pub fn version(&self) -> Option<Version> {
         self.config::<RequestOptions>()
-            .and_then(RequestOptions::enforced_version)
+            .and_then(|opts| opts.version)
     }
 
     /// Get a mutable reference to the http version.
     #[inline]
     pub fn version_mut(&mut self) -> &mut Option<Version> {
-        self.config_mut::<RequestOptions>()
+        &mut self
+            .config_mut::<RequestOptions>()
             .get_or_insert_default()
-            .enforced_version_mut()
+            .version
+    }
+
+    /// Returns a reference to the associated extensions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use wreq;
+    /// let request = wreq::get("http://httpbin.org/get")
+    ///     .build()
+    ///     .expect("failed to build request");
+    /// assert!(request.extensions().get::<i32>().is_none());
+    /// ```
+    #[inline]
+    pub fn extensions(&self) -> &Extensions {
+        self.0.extensions()
+    }
+
+    /// Returns a mutable reference to the associated extensions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use wreq;
+    /// let mut request = wreq::get("http://httpbin.org/get")
+    ///     .build()
+    ///     .expect("failed to build request");
+    /// request.extensions_mut().insert("hello");
+    /// assert_eq!(request.extensions().get(), Some(&"hello"));
+    /// ```
+    #[inline]
+    pub fn extensions_mut(&mut self) -> &mut Extensions {
+        self.0.extensions_mut()
     }
 
     /// Attempt to clone the request.
@@ -141,16 +173,6 @@ impl Request {
         *req.extensions_mut() = self.extensions().clone();
         *req.body_mut() = body;
         Some(req)
-    }
-
-    #[inline]
-    pub(crate) fn extensions(&self) -> &Extensions {
-        self.0.extensions()
-    }
-
-    #[inline]
-    pub(crate) fn extensions_mut(&mut self) -> &mut Extensions {
-        self.0.extensions_mut()
     }
 
     #[inline]
@@ -331,10 +353,7 @@ impl RequestBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn bearer_auth<T>(self, token: T) -> RequestBuilder
-    where
-        T: fmt::Display,
-    {
+    pub fn bearer_auth<T: fmt::Display>(self, token: T) -> RequestBuilder {
         let header_value = format!("Bearer {token}");
         self.header_sensitive(AUTHORIZATION, header_value, true)
     }
@@ -364,6 +383,125 @@ impl RequestBuilder {
                 .get_or_insert_default()
                 .read_timeout(timeout);
         }
+        self
+    }
+
+    /// Modify the query string of the URI.
+    ///
+    /// Modifies the URI of this request, adding the parameters provided.
+    /// This method appends and does not overwrite. This means that it can
+    /// be called multiple times and that existing query parameters are not
+    /// overwritten if the same key is used. The key will simply show up
+    /// twice in the query string.
+    /// Calling `.query(&[("foo", "a"), ("foo", "b")])` gives `"foo=a&foo=b"`.
+    ///
+    /// # Note
+    /// This method does not support serializing a single key-value
+    /// pair. Instead of using `.query(("key", "val"))`, use a sequence, such
+    /// as `.query(&[("key", "val")])`. It's also possible to serialize structs
+    /// and maps into a key-value pair.
+    ///
+    /// # Errors
+    /// This method will fail if the object you provide cannot be serialized
+    /// into a query string.
+    #[cfg(feature = "query")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "query")))]
+    pub fn query<T: Serialize + ?Sized>(mut self, query: &T) -> RequestBuilder {
+        let mut error = None;
+        if let Ok(ref mut req) = self.request {
+            match serde_html_form::to_string(query) {
+                Ok(serializer) => {
+                    let uri = req.uri_mut();
+                    uri.set_query(serializer);
+                }
+                Err(err) => error = Some(Error::builder(err)),
+            }
+        }
+        if let Some(err) = error {
+            self.request = Err(err);
+        }
+        self
+    }
+
+    /// Send a form body.
+    ///
+    /// Sets the body to the uri encoded serialization of the passed value,
+    /// and also sets the `Content-Type: application/x-www-form-urlencoded`
+    /// header.
+    ///
+    /// ```rust
+    /// # use wreq::Error;
+    /// # use std::collections::HashMap;
+    /// #
+    /// # async fn run() -> Result<(), Error> {
+    /// let mut params = HashMap::new();
+    /// params.insert("lang", "rust");
+    ///
+    /// let client = wreq::Client::new();
+    /// let res = client
+    ///     .post("http://httpbin.org")
+    ///     .form(&params)
+    ///     .send()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// This method fails if the passed value cannot be serialized into
+    /// uri encoded format
+    #[cfg(feature = "form")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "form")))]
+    pub fn form<T: Serialize + ?Sized>(mut self, form: &T) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            match serde_html_form::to_string(form) {
+                Ok(body) => {
+                    const HEADER_VALUE: HeaderValue =
+                        HeaderValue::from_static("application/x-www-form-urlencoded");
+
+                    req.headers_mut()
+                        .entry(CONTENT_TYPE)
+                        .or_insert(HEADER_VALUE);
+                    req.body_mut().replace(body.into());
+                }
+                Err(err) => self.request = Err(Error::builder(err)),
+            }
+        }
+        self
+    }
+
+    /// Send a JSON body.
+    ///
+    /// Serializes the value as JSON and sets the resulting bytes as the request body.
+    ///
+    /// Sets `Content-Type` to `application/json` unless it is already set.
+    ///
+    /// # Optional
+    ///
+    /// This requires the optional `json` feature enabled.
+    ///
+    /// # Errors
+    ///
+    /// Serialization can fail if `T`'s implementation of `Serialize` decides to
+    /// fail, or if `T` contains a map with non-string keys.
+    #[cfg(feature = "json")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
+    pub fn json<T: Serialize + ?Sized>(mut self, json: &T) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            match serde_json::to_vec(json) {
+                Ok(body) => {
+                    const HEADER_VALUE: HeaderValue = HeaderValue::from_static("application/json");
+
+                    req.headers_mut()
+                        .entry(CONTENT_TYPE)
+                        .or_insert(HEADER_VALUE);
+                    req.body_mut().replace(body.into());
+                }
+                Err(err) => self.request = Err(Error::builder(err)),
+            }
+        }
+
         self
     }
 
@@ -420,120 +558,13 @@ impl RequestBuilder {
         self
     }
 
-    /// Modify the query string of the URI.
-    ///
-    /// Modifies the URI of this request, adding the parameters provided.
-    /// This method appends and does not overwrite. This means that it can
-    /// be called multiple times and that existing query parameters are not
-    /// overwritten if the same key is used. The key will simply show up
-    /// twice in the query string.
-    /// Calling `.query(&[("foo", "a"), ("foo", "b")])` gives `"foo=a&foo=b"`.
-    ///
-    /// # Note
-    /// This method does not support serializing a single key-value
-    /// pair. Instead of using `.query(("key", "val"))`, use a sequence, such
-    /// as `.query(&[("key", "val")])`. It's also possible to serialize structs
-    /// and maps into a key-value pair.
-    ///
-    /// # Errors
-    /// This method will fail if the object you provide cannot be serialized
-    /// into a query string.
-    #[cfg(feature = "query")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "query")))]
-    pub fn query<T: Serialize + ?Sized>(mut self, query: &T) -> RequestBuilder {
-        let mut error = None;
-        if let Ok(ref mut req) = self.request {
-            match serde_urlencoded::to_string(query) {
-                Ok(serializer) => {
-                    let uri = req.uri_mut();
-                    uri.set_query(serializer);
-                }
-                Err(err) => error = Some(Error::builder(err)),
-            }
-        }
-        if let Some(err) = error {
-            self.request = Err(err);
-        }
-        self
-    }
-
-    /// Send a form body.
-    ///
-    /// Sets the body to the uri encoded serialization of the passed value,
-    /// and also sets the `Content-Type: application/x-www-form-urlencoded`
-    /// header.
-    ///
-    /// ```rust
-    /// # use wreq::Error;
-    /// # use std::collections::HashMap;
-    /// #
-    /// # async fn run() -> Result<(), Error> {
-    /// let mut params = HashMap::new();
-    /// params.insert("lang", "rust");
-    ///
-    /// let client = wreq::Client::new();
-    /// let res = client
-    ///     .post("http://httpbin.org")
-    ///     .form(&params)
-    ///     .send()
-    ///     .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// This method fails if the passed value cannot be serialized into
-    /// uri encoded format
-    #[cfg(feature = "form")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "form")))]
-    pub fn form<T: Serialize + ?Sized>(mut self, form: &T) -> RequestBuilder {
-        if let Ok(ref mut req) = self.request {
-            match serde_urlencoded::to_string(form) {
-                Ok(body) => {
-                    req.headers_mut().entry(CONTENT_TYPE).or_insert_with(|| {
-                        HeaderValue::from_static("application/x-www-form-urlencoded")
-                    });
-                    *req.body_mut() = Some(body.into());
-                }
-                Err(err) => self.request = Err(Error::builder(err)),
-            }
-        }
-        self
-    }
-
-    /// Send a JSON body.
-    ///
-    /// # Optional
-    ///
-    /// This requires the optional `json` feature enabled.
-    ///
-    /// # Errors
-    ///
-    /// Serialization can fail if `T`'s implementation of `Serialize` decides to
-    /// fail, or if `T` contains a map with non-string keys.
-    #[cfg(feature = "json")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
-    pub fn json<T: Serialize + ?Sized>(mut self, json: &T) -> RequestBuilder {
-        if let Ok(ref mut req) = self.request {
-            match serde_json::to_vec(json) {
-                Ok(body) => {
-                    req.headers_mut()
-                        .entry(CONTENT_TYPE)
-                        .or_insert_with(|| HeaderValue::from_static("application/json"));
-                    *req.body_mut() = Some(body.into());
-                }
-                Err(err) => self.request = Err(Error::builder(err)),
-            }
-        }
-
-        self
-    }
-
     /// Set HTTP version
     pub fn version(mut self, version: Version) -> RequestBuilder {
         if let Ok(ref mut req) = self.request {
             req.version_mut().replace(version);
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .version = Some(version);
         }
         self
     }
@@ -549,13 +580,12 @@ impl RequestBuilder {
     /// Set the persistent cookie store for the request.
     #[cfg(feature = "cookies")]
     #[cfg_attr(docsrs, doc(cfg(feature = "cookies")))]
-    pub fn cookie_provider<C>(mut self, cookie_store: C) -> RequestBuilder
-    where
-        C: IntoCookieStore,
-    {
+    pub fn cookie_provider<C: IntoCookieStore>(mut self, cookie_store: C) -> RequestBuilder {
         if let Ok(ref mut req) = self.request {
+            use std::sync::Arc;
+
             req.config_mut::<Arc<dyn CookieStore>>()
-                .replace(cookie_store.into_cookie_store());
+                .replace(cookie_store.into_shared());
         }
         self
     }
@@ -613,8 +643,7 @@ impl RequestBuilder {
         if let Ok(ref mut req) = self.request {
             req.config_mut::<RequestOptions>()
                 .get_or_insert_default()
-                .proxy_matcher_mut()
-                .replace(proxy.into_matcher());
+                .proxy = Some(proxy.into_matcher());
         }
         self
     }
@@ -627,14 +656,15 @@ impl RequestBuilder {
         if let Ok(ref mut req) = self.request {
             req.config_mut::<RequestOptions>()
                 .get_or_insert_default()
-                .tcp_connect_opts_mut()
-                .set_local_address(local_address.into());
+                .socket_bind_options
+                .get_or_insert_default()
+                .set_local_address(local_address);
         }
         self
     }
 
     /// Set the local addresses for this request.
-    pub fn local_addresses<V4, V6>(mut self, ipv4: V4, ipv6: V6) -> RequestBuilder
+    pub fn local_addresses<V4, V6>(mut self, ipv4_address: V4, ipv6_address: V6) -> RequestBuilder
     where
         V4: Into<Option<Ipv4Addr>>,
         V6: Into<Option<Ipv6Addr>>,
@@ -642,13 +672,45 @@ impl RequestBuilder {
         if let Ok(ref mut req) = self.request {
             req.config_mut::<RequestOptions>()
                 .get_or_insert_default()
-                .tcp_connect_opts_mut()
-                .set_local_addresses(ipv4, ipv6);
+                .socket_bind_options
+                .get_or_insert_default()
+                .set_local_addresses(ipv4_address, ipv6_address);
         }
         self
     }
 
-    /// Set the interface for this request.
+    /// Bind connections only on the specified network interface.
+    ///
+    /// This option is only available on the following operating systems:
+    ///
+    /// - Android
+    /// - Fuchsia
+    /// - Linux,
+    /// - macOS and macOS-like systems (iOS, tvOS, watchOS and visionOS)
+    /// - Solaris and illumos
+    ///
+    /// On Android, Linux, and Fuchsia, this uses the
+    /// [`SO_BINDTODEVICE`][man-7-socket] socket option. On macOS and macOS-like
+    /// systems, Solaris, and illumos, this instead uses the [`IP_BOUND_IF` and
+    /// `IPV6_BOUND_IF`][man-7p-ip] socket options (as appropriate).
+    ///
+    /// Note that connections will fail if the provided interface name is not a
+    /// network interface that currently exists when a connection is established.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # fn doc() -> Result<(), wreq::Error> {
+    /// let interface = "lo";
+    /// let client = wreq::Client::builder()
+    ///     .interface(interface)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [man-7-socket]: https://man7.org/linux/man-pages/man7/socket.7.html
+    /// [man-7p-ip]: https://docs.oracle.com/cd/E86824_01/html/E54777/ip-7p.html
     #[cfg(any(
         target_os = "android",
         target_os = "fuchsia",
@@ -683,32 +745,57 @@ impl RequestBuilder {
         if let Ok(ref mut req) = self.request {
             req.config_mut::<RequestOptions>()
                 .get_or_insert_default()
-                .tcp_connect_opts_mut()
+                .socket_bind_options
+                .get_or_insert_default()
                 .set_interface(interface);
         }
         self
     }
 
-    /// Set the emulation for this request.
-    pub fn emulation<P>(mut self, factory: P) -> RequestBuilder
-    where
-        P: EmulationFactory,
-    {
+    /// Sets the request builder to emulation the specified HTTP context.
+    ///
+    /// This method sets the necessary headers, HTTP/1 and HTTP/2 options configurations, and  TLS
+    /// options config to use the specified HTTP context. It allows the client to mimic the
+    /// behavior of different versions or setups, which can be useful for testing or ensuring
+    /// compatibility with various environments.
+    ///
+    /// # Note
+    /// This will overwrite the existing configuration.
+    /// You must set emulation before you can perform subsequent HTTP1/HTTP2/TLS fine-tuning.
+    pub fn emulation<T: IntoEmulation>(mut self, emulation: T) -> RequestBuilder {
         if let Ok(ref mut req) = self.request {
-            let emulation = factory.emulation();
-            let (transport_opts, default_headers, orig_headers) = emulation.into_parts();
-            req.config_mut::<RequestOptions>()
-                .get_or_insert_default()
-                .transport_opts_mut()
-                .apply_transport_options(transport_opts);
-            self = self.headers(default_headers).orig_headers(orig_headers);
+            let emulation = emulation.into_emulation();
+            let opts = req.config_mut::<RequestOptions>().get_or_insert_default();
+            opts.group.emulate(emulation.group);
+            opts.tls_options = emulation.tls_options;
+            opts.http1_options = emulation.http1_options;
+            opts.http2_options = emulation.http2_options;
+            return self
+                .headers(emulation.headers)
+                .orig_headers(emulation.orig_headers);
         }
 
         self
     }
 
+    /// Assigns a logical group to this request.
+    ///
+    /// Groups define the request's identity and execution context.
+    /// Requests in different groups are logically partitioned to ensure
+    /// resource isolation and prevent metadata leakage.
+    pub fn group(mut self, group: Group) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .group
+                .request(group);
+        }
+        self
+    }
+
     /// Build a `Request`, which can be inspected, modified and executed with
     /// [`Client::execute()`].
+    #[inline]
     pub fn build(self) -> crate::Result<Request> {
         self.request
     }
@@ -718,6 +805,7 @@ impl RequestBuilder {
     ///
     /// This is similar to [`RequestBuilder::build()`], but also returns the
     /// embedded [`Client`].
+    #[inline]
     pub fn build_split(self) -> (Client, crate::Result<Request>) {
         (self.client, self.request)
     }
@@ -743,7 +831,7 @@ impl RequestBuilder {
     pub fn send(self) -> impl Future<Output = crate::Result<Response>> {
         match self.request {
             Ok(req) => self.client.execute(req),
-            Err(err) => Pending::error(err),
+            Err(err) => Pending::Error { error: Some(err) },
         }
     }
 
@@ -803,16 +891,16 @@ fn extract_authority(uri: &mut Uri) -> Option<(String, Option<String>)> {
     None
 }
 
-impl<T: Into<Body>> From<HttpRequest<T>> for Request {
+impl<T: Into<Body>> From<http::Request<T>> for Request {
     #[inline]
-    fn from(req: HttpRequest<T>) -> Request {
+    fn from(req: http::Request<T>) -> Request {
         Request(req.map(Into::into).map(Some))
     }
 }
 
-impl From<Request> for HttpRequest<Body> {
+impl From<Request> for http::Request<Body> {
     #[inline]
-    fn from(req: Request) -> HttpRequest<Body> {
+    fn from(req: Request) -> http::Request<Body> {
         req.0.map(|body| body.unwrap_or_else(Body::empty))
     }
 }

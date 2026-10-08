@@ -2,13 +2,16 @@
 
 [![CI](https://github.com/0x676e67/wreq/actions/workflows/ci.yml/badge.svg)](https://github.com/0x676e67/wreq/actions/workflows/ci.yml)
 [![Crates.io License](https://img.shields.io/crates/l/wreq)](https://github.com/0x676e67/wreq/blob/main/LICENSE)
-[![Crates.io MSRV](https://img.shields.io/crates/msrv/wreq?logo=rust)](https://crates.io/crates/wreq)
-[![crates.io](https://img.shields.io/crates/v/wreq.svg?logo=rust)](https://crates.io/crates/wreq)
-[![docs.rs](https://img.shields.io/docsrs/wreq?logo=rust)](https://docs.rs/wreq)
+[![Crates.io MSRV](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcrates.io%2Fapi%2Fv1%2Fcrates%2Fwreq%2Fversions%3Fsort%3Ddate%26per_page%3D1&query=%24.versions%5B0%5D.rust_version&suffix=.0&label=MSRV&color=blue&logo=rust)](https://crates.io/crates/wreq)
+[![crates.io](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcrates.io%2Fapi%2Fv1%2Fcrates%2Fwreq&query=%24.crate.max_stable_version&prefix=v&label=crates.io&color=orange&logo=rust)](https://crates.io/crates/wreq)
+[![Discord chat][discord-badge]][discord-url]
+
+[discord-badge]: https://img.shields.io/discord/1486741856397164788.svg?logo=discord
+[discord-url]: https://discord.gg/rfbvyFkgq3
 
 > 🚀 Help me work seamlessly with open source sharing by [sponsoring me on GitHub](https://github.com/0x676e67/0x676e67/blob/main/SPONSOR.md)
 
-An ergonomic and modular Rust HTTP client for advanced and low-level emulation, with customizable TLS, JA3/JA4, and HTTP/2 fingerprinting capabilities.
+An ergonomic and modular Rust HTTP Client for high-fidelity protocol matching, featuring customizable TLS, JA3/JA4, and HTTP/2 signature capabilities.
 
 ## Features
 
@@ -21,8 +24,9 @@ An ergonomic and modular Rust HTTP client for advanced and low-level emulation, 
 - Tower Middleware
 - WebSocket Upgrade
 - HTTPS via BoringSSL
-- HTTP/2 over TLS Emulation
+- HTTP/2 over TLS Parity
 - Certificate Store (CAs & mTLS)
+- Multiple Runtime (Tokio, Compio)
 
 ## Example
 
@@ -31,8 +35,8 @@ The following example uses the [Tokio](https://tokio.rs) runtime with optional f
 ```toml
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-wreq = "6.0.0-rc.28"
-wreq-util = "3.0.0-rc.10"
+wreq = "0.16"
+wreq-util = "0.2"
 ```
 
 And then the code:
@@ -49,7 +53,7 @@ async fn main() -> wreq::Result<()> {
         .build()?;
 
     // Use the API you're already familiar with
-    let resp = client.get("https://tls.peet.ws/api/all").send().await?;
+    let resp = client.get("https://pingly.us.kg/api/all").send().await?;
     println!("{}", resp.text().await?);
     Ok(())
 }
@@ -67,18 +71,13 @@ Due to the complexity of **TLS** encryption and the widespread adoption of **HTT
 
 - **Device Emulation**
 
-Most browser device models share identical **TLS** and **HTTP/2** configurations, differing only in the **User-Agent** string. Common browser device emulation templates are maintained in [wreq-util](https://github.com/0x676e67/wreq-util), a companion utility crate.
+**TLS** and **HTTP/2** fingerprints are often identical across various browser models because these underlying protocols evolve slower than browser release cycles. **100+ browser device emulation profiles** are maintained in [wreq-util](https://github.com/0x676e67/wreq-util).
 
 ## Building
 
-Compiling alongside **openssl-sys** can cause symbol conflicts with **boring-sys** that lead to [link failures](https://github.com/cloudflare/boring/issues/197), and on **Linux** and **Android** this can be avoided by enabling the **prefix-symbols** feature.
+Compiling alongside **openssl-sys** can cause symbol conflicts with **boringssl** that lead to [link failures](https://github.com/cloudflare/boring/issues/197), and on **Linux** and **Android** this can be avoided by enabling the **`prefix-symbols`** feature.
 
-```toml
-[dependencies]
-wreq = { version = "6.0.0-rc.27", features = ["prefix-symbols"] }
-```
-
-Install the dependencies required to build [BoringSSL](https://github.com/google/boringssl/blob/master/BUILDING.md#build-prerequisites)
+Install [BoringSSL build dependencies](https://github.com/google/boringssl/blob/master/BUILDING.md#build-prerequisites) and build with:
 
 ```bash
 sudo apt-get install build-essential cmake perl pkg-config libclang-dev musl-tools git -y
@@ -101,6 +100,18 @@ Unless you explicitly state otherwise, any contribution intentionally submitted 
 
 ## Sponsors
 
+<a href="https://captcha.fun/?utm_source=github&utm_medium=readme&utm_campaign=wreq" target="_blank"><img src="https://www.captcha.fun/banner.jpg" height="47" width="149"></a>
+
+**Solve reCAPTCHA in less than 2 seconds**
+
+**[Captcha.fun](https://captcha.fun/?utm_source=github&utm_medium=readme&utm_campaign=wreq)** delivers fast, reliable CAPTCHA solving built for automation at scale.
+
+With simple API integration, consistent performance, and competitive pricing, it's an easy way to keep your workflows moving without delays—use code **`WREQ`** for **10% bonus credits**.
+
+**[Dashboard](https://dash.captcha.fun/)** | **[Docs](http://docs.captcha.fun/)** | **[Discord](https://discord.gg/captchafun)**
+
+---
+
 <a href="https://hypersolutions.co/?utm_source=github&utm_medium=readme&utm_campaign=wreq" target="_blank"><img src="https://raw.githubusercontent.com/0x676e67/wreq/main/.github/assets/hypersolutions.jpg" height="47" width="149"></a>
 
 TLS fingerprinting alone isn't enough for modern bot protection. **[Hyper Solutions](https://hypersolutions.co?utm_source=github&utm_medium=readme&utm_campaign=wreq)** provides the missing piece - API endpoints that generate valid antibot tokens for:
@@ -109,13 +120,7 @@ TLS fingerprinting alone isn't enough for modern bot protection. **[Hyper Soluti
 
 No browser automation. Just simple API calls that return the exact cookies and headers these systems require.
 
-🚀 **[Get Your API Key](https://hypersolutions.co?utm_source=github&utm_medium=readme&utm_campaign=wreq)** | 📖 **[Docs](https://docs.justhyped.dev)** | 💬 **[Discord](https://discord.gg/akamai)**
-
----
-
-<a href="https://dashboard.capsolver.com/passport/register?inviteCode=y7CtB_a-3X6d" target="_blank"><img src="https://raw.githubusercontent.com/0x676e67/wreq/main/.github/assets/capsolver.jpg" height="47" width="149"></a>
-
-[CapSolver](https://www.capsolver.com/?utm_source=github&utm_medium=banner_repo&utm_campaign=wreq) leverages AI-powered Auto Web Unblock to bypass Captchas effortlessly, providing fast, reliable, and cost-effective data access with seamless integration into Colly, Puppeteer, and Playwright—use code **`RQUEST`** for a 6% bonus!
+**[Dashboard](https://hypersolutions.co?utm_source=github&utm_medium=readme&utm_campaign=wreq)** | **[Docs](https://docs.justhyped.dev)** | **[Discord](https://discord.gg/akamai)**
 
 ## Accolades
 

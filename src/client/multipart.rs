@@ -4,19 +4,22 @@ use std::{borrow::Cow, pin::Pin};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, future, stream};
+use http::header::HeaderMap;
 use http_body_util::BodyExt;
 use mime_guess::Mime;
 use percent_encoding::{self, AsciiSet, NON_ALPHANUMERIC};
-#[cfg(feature = "stream")]
+#[cfg(all(feature = "tokio-rt", feature = "stream"))]
 use {std::io, std::path::Path, tokio::fs::File};
 
 use super::Body;
-use crate::header::HeaderMap;
 
 /// An async multipart/form-data request.
 #[derive(Debug)]
 pub struct Form {
-    inner: FormParts<Part>,
+    boundary: Cow<'static, str>,
+    computed_headers: Vec<Vec<u8>>,
+    fields: Vec<(Cow<'static, str>, Part)>,
+    percent_encoding: PercentEncoding,
 }
 
 /// A field in a multipart form.
@@ -28,23 +31,10 @@ pub struct Part {
 }
 
 #[derive(Debug)]
-pub(crate) struct FormParts<P> {
-    pub(crate) boundary: String,
-    pub(crate) computed_headers: Vec<Vec<u8>>,
-    pub(crate) fields: Vec<(Cow<'static, str>, P)>,
-    pub(crate) percent_encoding: PercentEncoding,
-}
-
-#[derive(Debug)]
-pub(crate) struct PartMetadata {
+struct PartMetadata {
     mime: Option<Mime>,
     file_name: Option<Cow<'static, str>>,
-    pub(crate) headers: HeaderMap,
-}
-
-pub(crate) trait PartProps {
-    fn value_len(&self) -> Option<u64>;
-    fn metadata(&self) -> &PartMetadata;
+    headers: HeaderMap,
 }
 
 // ===== impl Form =====
@@ -58,15 +48,29 @@ impl Default for Form {
 impl Form {
     /// Creates a new async Form without any content.
     pub fn new() -> Form {
+        Form::with_boundary(gen_boundary())
+    }
+
+    /// Creates a new async Form with a custom boundary.
+    ///
+    /// **Setting a custom boundary incurs significant risk of generating
+    /// corrupted bodies.** Only use this if you need it and you understand the
+    /// risk!
+    pub fn with_boundary<S>(boundary: S) -> Form
+    where
+        S: Into<Cow<'static, str>>,
+    {
         Form {
-            inner: FormParts::new(),
+            boundary: boundary.into(),
+            computed_headers: Vec::new(),
+            fields: Vec::new(),
+            percent_encoding: PercentEncoding::PathSegment,
         }
     }
 
     /// Get the boundary that this form will use.
-    #[inline]
     pub fn boundary(&self) -> &str {
-        self.inner.boundary()
+        &self.boundary
     }
 
     /// Add a data field with supplied name and value.
@@ -104,8 +108,8 @@ impl Form {
     /// # Errors
     ///
     /// Errors when the file cannot be opened.
-    #[cfg(feature = "stream")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "stream")))]
+    #[cfg(all(feature = "tokio-rt", feature = "stream"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "tokio-rt", feature = "stream"))))]
     pub async fn file<T, U>(self, name: T, path: U) -> io::Result<Form>
     where
         T: Into<Cow<'static, str>>,
@@ -115,31 +119,35 @@ impl Form {
     }
 
     /// Adds a customized Part.
-    pub fn part<T>(self, name: T, part: Part) -> Form
+    pub fn part<T>(mut self, name: T, part: Part) -> Form
     where
         T: Into<Cow<'static, str>>,
     {
-        self.with_inner(move |inner| inner.part(name, part))
+        self.fields.push((name.into(), part));
+        self
     }
 
     /// Configure this `Form` to percent-encode using the `path-segment` rules.
-    pub fn percent_encode_path_segment(self) -> Form {
-        self.with_inner(|inner| inner.percent_encode_path_segment())
+    pub fn percent_encode_path_segment(mut self) -> Form {
+        self.percent_encoding = PercentEncoding::PathSegment;
+        self
     }
 
     /// Configure this `Form` to percent-encode using the `attr-char` rules.
-    pub fn percent_encode_attr_chars(self) -> Form {
-        self.with_inner(|inner| inner.percent_encode_attr_chars())
+    pub fn percent_encode_attr_chars(mut self) -> Form {
+        self.percent_encoding = PercentEncoding::AttrChar;
+        self
     }
 
     /// Configure this `Form` to skip percent-encoding
-    pub fn percent_encode_noop(self) -> Form {
-        self.with_inner(|inner| inner.percent_encode_noop())
+    pub fn percent_encode_noop(mut self) -> Form {
+        self.percent_encoding = PercentEncoding::NoOp;
+        self
     }
 
     /// Consume this instance and transform into an instance of Body for use in a request.
     pub(crate) fn stream(self) -> Body {
-        if self.inner.fields.is_empty() {
+        if self.fields.is_empty() {
             return Body::empty();
         }
 
@@ -148,7 +156,7 @@ impl Form {
 
     /// Produce a stream of the bytes in this `Form`, consuming it.
     pub fn into_stream(mut self) -> impl Stream<Item = Result<Bytes, crate::Error>> + Send + Sync {
-        if self.inner.fields.is_empty() {
+        if self.fields.is_empty() {
             let empty_stream: Pin<
                 Box<dyn Stream<Item = Result<Bytes, crate::Error>> + Send + Sync>,
             > = Box::pin(futures_util::stream::empty());
@@ -156,11 +164,11 @@ impl Form {
         }
 
         // create initial part to init reduce chain
-        let (name, part) = self.inner.fields.remove(0);
+        let (name, part) = self.fields.remove(0);
         let start = Box::pin(self.part_stream(name, part))
             as Pin<Box<dyn Stream<Item = crate::Result<Bytes>> + Send + Sync>>;
 
-        let fields = self.inner.take_fields();
+        let fields = self.take_fields();
         // for each field, chain an additional stream
         let stream = fields.into_iter().fold(start, |memo, (name, part)| {
             let part_stream = self.part_stream(name, part);
@@ -169,7 +177,7 @@ impl Form {
         });
         // append special ending boundary
         let last = stream::once(future::ready(Ok(
-            format!("--{}--\r\n", self.boundary()).into()
+            format!("--{}--\r\n", self.boundary).into()
         )));
         Box::pin(stream.chain(last))
     }
@@ -184,13 +192,10 @@ impl Form {
         T: Into<Cow<'static, str>>,
     {
         // start with boundary
-        let boundary = stream::once(future::ready(Ok(
-            format!("--{}\r\n", self.boundary()).into()
-        )));
+        let boundary = stream::once(future::ready(Ok(format!("--{}\r\n", self.boundary).into())));
         // append headers
         let header = stream::once(future::ready(Ok({
             let mut h = self
-                .inner
                 .percent_encoding
                 .encode_headers(&name.into(), &part.meta);
             h.extend_from_slice(b"\r\n\r\n");
@@ -203,17 +208,44 @@ impl Form {
             .chain(stream::once(future::ready(Ok("\r\n".into()))))
     }
 
+    // If predictable, computes the length the request will have
+    // The length should be predictable if only String and file fields have been added,
+    // but not if a generic reader has been added;
     pub(crate) fn compute_length(&mut self) -> Option<u64> {
-        self.inner.compute_length()
+        let mut length = 0u64;
+        for (name, field) in self.fields.iter() {
+            match field.value_len() {
+                Some(value_length) => {
+                    // We are constructing the header just to get its length. To not have to
+                    // construct it again when the request is sent we cache these headers.
+                    let header = self.percent_encoding.encode_headers(name, field.metadata());
+                    let header_length = header.len();
+                    self.computed_headers.push(header);
+                    // The additions mimic the format string out of which the field is constructed
+                    // in Reader. Not the cleanest solution because if that format string is
+                    // ever changed then this formula needs to be changed too which is not an
+                    // obvious dependency in the code.
+                    length += 2
+                        + self.boundary.len() as u64
+                        + 2
+                        + header_length as u64
+                        + 4
+                        + value_length
+                        + 2
+                }
+                _ => return None,
+            }
+        }
+        // If there is at least one field there is a special boundary for the very last field.
+        if !self.fields.is_empty() {
+            length += 2 + self.boundary.len() as u64 + 4
+        }
+        Some(length)
     }
 
-    fn with_inner<F>(self, func: F) -> Self
-    where
-        F: FnOnce(FormParts<Part>) -> FormParts<Part>,
-    {
-        Form {
-            inner: func(self.inner),
-        }
+    /// Take the fields vector of this instance, replacing with an empty vector.
+    fn take_fields(&mut self) -> Vec<(Cow<'static, str>, Part)> {
+        std::mem::take(&mut self.fields)
     }
 }
 
@@ -261,8 +293,8 @@ impl Part {
     /// # Errors
     ///
     /// Errors when the file cannot be opened.
-    #[cfg(feature = "stream")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "stream")))]
+    #[cfg(all(feature = "tokio-rt", feature = "stream"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "tokio-rt", feature = "stream"))))]
     pub async fn file<T: AsRef<Path>>(path: T) -> io::Result<Part> {
         let path = path.as_ref();
         let file_name = path
@@ -316,18 +348,6 @@ impl Part {
         self.with_inner(move |inner| inner.headers(headers))
     }
 
-    fn with_inner<F>(self, func: F) -> Self
-    where
-        F: FnOnce(PartMetadata) -> PartMetadata,
-    {
-        Part {
-            meta: func(self.meta),
-            ..self
-        }
-    }
-}
-
-impl PartProps for Part {
     fn value_len(&self) -> Option<u64> {
         if self.body_length.is_some() {
             self.body_length
@@ -339,96 +359,22 @@ impl PartProps for Part {
     fn metadata(&self) -> &PartMetadata {
         &self.meta
     }
-}
 
-// ===== impl FormParts =====
-
-impl<P: PartProps> FormParts<P> {
-    pub(crate) fn new() -> Self {
-        FormParts {
-            boundary: gen_boundary(),
-            computed_headers: Vec::new(),
-            fields: Vec::new(),
-            percent_encoding: PercentEncoding::PathSegment,
-        }
-    }
-
-    pub(crate) fn boundary(&self) -> &str {
-        &self.boundary
-    }
-
-    /// Adds a customized Part.
-    pub(crate) fn part<T>(mut self, name: T, part: P) -> Self
+    fn with_inner<F>(self, func: F) -> Self
     where
-        T: Into<Cow<'static, str>>,
+        F: FnOnce(PartMetadata) -> PartMetadata,
     {
-        self.fields.push((name.into(), part));
-        self
-    }
-
-    /// Configure this `Form` to percent-encode using the `path-segment` rules.
-    pub(crate) fn percent_encode_path_segment(mut self) -> Self {
-        self.percent_encoding = PercentEncoding::PathSegment;
-        self
-    }
-
-    /// Configure this `Form` to percent-encode using the `attr-char` rules.
-    pub(crate) fn percent_encode_attr_chars(mut self) -> Self {
-        self.percent_encoding = PercentEncoding::AttrChar;
-        self
-    }
-
-    /// Configure this `Form` to skip percent-encoding
-    pub(crate) fn percent_encode_noop(mut self) -> Self {
-        self.percent_encoding = PercentEncoding::NoOp;
-        self
-    }
-
-    // If predictable, computes the length the request will have
-    // The length should be predictable if only String and file fields have been added,
-    // but not if a generic reader has been added;
-    pub(crate) fn compute_length(&mut self) -> Option<u64> {
-        let mut length = 0u64;
-        for (name, field) in self.fields.iter() {
-            match field.value_len() {
-                Some(value_length) => {
-                    // We are constructing the header just to get its length. To not have to
-                    // construct it again when the request is sent we cache these headers.
-                    let header = self.percent_encoding.encode_headers(name, field.metadata());
-                    let header_length = header.len();
-                    self.computed_headers.push(header);
-                    // The additions mimic the format string out of which the field is constructed
-                    // in Reader. Not the cleanest solution because if that format string is
-                    // ever changed then this formula needs to be changed too which is not an
-                    // obvious dependency in the code.
-                    length += 2
-                        + self.boundary().len() as u64
-                        + 2
-                        + header_length as u64
-                        + 4
-                        + value_length
-                        + 2
-                }
-                _ => return None,
-            }
+        Part {
+            meta: func(self.meta),
+            ..self
         }
-        // If there is at least one field there is a special boundary for the very last field.
-        if !self.fields.is_empty() {
-            length += 2 + self.boundary().len() as u64 + 4
-        }
-        Some(length)
-    }
-
-    /// Take the fields vector of this instance, replacing with an empty vector.
-    fn take_fields(&mut self) -> Vec<(Cow<'static, str>, P)> {
-        std::mem::take(&mut self.fields)
     }
 }
 
 // ===== impl PartMetadata =====
 
 impl PartMetadata {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         PartMetadata {
             mime: None,
             file_name: None,
@@ -436,12 +382,12 @@ impl PartMetadata {
         }
     }
 
-    pub(crate) fn mime(mut self, mime: Mime) -> Self {
+    fn mime(mut self, mime: Mime) -> Self {
         self.mime = Some(mime);
         self
     }
 
-    pub(crate) fn file_name<T>(mut self, filename: T) -> Self
+    fn file_name<T>(mut self, filename: T) -> Self
     where
         T: Into<Cow<'static, str>>,
     {
@@ -449,7 +395,7 @@ impl PartMetadata {
         self
     }
 
-    pub(crate) fn headers<T>(mut self, headers: T) -> Self
+    fn headers<T>(mut self, headers: T) -> Self
     where
         T: Into<HeaderMap>,
     {
@@ -487,14 +433,14 @@ const ATTR_CHAR_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~');
 
 #[derive(Debug)]
-pub(crate) enum PercentEncoding {
+enum PercentEncoding {
     PathSegment,
     AttrChar,
     NoOp,
 }
 
 impl PercentEncoding {
-    pub(crate) fn encode_headers(&self, name: &str, field: &PartMetadata) -> Vec<u8> {
+    fn encode_headers(&self, name: &str, field: &PartMetadata) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"Content-Disposition: form-data; ");
 
@@ -550,15 +496,45 @@ impl PercentEncoding {
     }
 }
 
+/// See chromium's implementation: <https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/platform/network/form_data_encoder.cc>
 fn gen_boundary() -> String {
     use crate::util::fast_random as random;
 
-    let a = random();
-    let b = random();
-    let c = random();
-    let d = random();
+    const PREFIX: &[u8; 22] = b"----WebKitFormBoundary";
 
-    format!("{a:016x}-{b:016x}-{c:016x}-{d:016x}")
+    // The RFC 2046 spec says the alphanumeric characters plus the
+    // following characters are legal for boundaries:  '()+_,-./:=?
+    // However the following characters, though legal, cause some sites
+    // to fail: (),./:=+
+    // Note that our algorithm makes it twice as much likely for 'A' or 'B'
+    // to appear in the boundary string, because 0x41 and 0x42 are present in
+    // the below array twice.
+    const ALPHA_NUMERIC_ENCODING_MAP: [u8; 64] = [
+        0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F,
+        0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x61, 0x62, 0x63, 0x64,
+        0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73,
+        0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+        0x38, 0x39, 0x41, 0x42,
+    ];
+
+    // Pre-allocate a buffer for the boundary string. The final length will be 22 (prefix) + 16
+    // (random chars) = 38.
+    let mut boundary = Vec::with_capacity(38);
+    // Start with an informative prefix.
+    boundary.extend_from_slice(PREFIX);
+
+    // Append 16 random 7bit ascii AlphaNumeric characters.
+    for _ in 0..2 {
+        let mut randomness = random();
+        for _ in 0..8 {
+            let index = (randomness & 0x3F) as usize;
+            boundary.push(ALPHA_NUMERIC_ENCODING_MAP[index]);
+            randomness >>= 6;
+        }
+    }
+
+    assert_eq!(boundary.len(), 38);
+    String::from_utf8(boundary).expect("Invalid UTF-8 generated")
 }
 
 #[cfg(test)]
@@ -610,7 +586,7 @@ mod tests {
                 ))))),
             )
             .part("key3", Part::text("value3").file_name("filename"));
-        form.inner.boundary = "boundary".to_string();
+        form.boundary = "boundary".into();
         let expected = "--boundary\r\n\
              Content-Disposition: form-data; name=\"reader1\"\r\n\r\n\
              part1\r\n\
@@ -651,7 +627,7 @@ mod tests {
         headers.insert("Hdr3", "/a/b/c".parse().unwrap());
         part = part.headers(headers);
         let mut form = Form::new().part("key2", part);
-        form.inner.boundary = "boundary".to_string();
+        form.boundary = "boundary".into();
         let expected = "--boundary\r\n\
                         Content-Disposition: form-data; name=\"key2\"\r\n\
                         Content-Type: image/bmp\r\n\
@@ -713,5 +689,12 @@ mod tests {
             PercentEncoding::AttrChar.encode_headers(name, &field.meta),
             &b"Content-Disposition: form-data; name*=utf-8''start%25%27%22%0D%0A%C3%9Fend"[..]
         );
+    }
+
+    #[test]
+    fn custom_boundary_is_applied() {
+        let form = Form::with_boundary("----WebKitFormBoundary0123456789");
+
+        assert_eq!(form.boundary(), "----WebKitFormBoundary0123456789");
     }
 }

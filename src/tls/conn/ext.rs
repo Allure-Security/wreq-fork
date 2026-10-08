@@ -1,82 +1,91 @@
-use boring2::ssl::{SslConnectorBuilder, SslVerifyMode};
+use btls::ssl::{SslConnectorBuilder, SslVerifyMode};
 
 use crate::{
     Error,
     tls::{
-        CertificateCompressionAlgorithm,
-        conn::cert_compression::{
-            BrotliCertificateCompressor, ZlibCertificateCompressor, ZstdCertificateCompressor,
-        },
-        x509::CertStore,
+        compress::{self, CertificateCompressor},
+        trust::{CertStore, Identity},
     },
 };
 
 /// SslConnectorBuilderExt trait for `SslConnectorBuilder`.
 pub trait SslConnectorBuilderExt {
+    /// Configure the Identity for the given `SslConnectorBuilder`.
+    fn set_identity(self, identity: Option<&Identity>) -> crate::Result<SslConnectorBuilder>;
+
     /// Configure the CertStore for the given `SslConnectorBuilder`.
     fn set_cert_store(self, store: Option<&CertStore>) -> crate::Result<SslConnectorBuilder>;
 
     /// Configure the certificate verification for the given `SslConnectorBuilder`.
-    fn set_cert_verification(self, enable: bool) -> crate::Result<SslConnectorBuilder>;
+    fn set_cert_verification(self, enable: bool) -> SslConnectorBuilder;
 
-    /// Configure the certificate compression algorithm for the given `SslConnectorBuilder`.
-    fn add_certificate_compression_algorithms(
+    /// Configure the certificate compressors for the given `SslConnectorBuilder`.
+    fn set_cert_compressors(
         self,
-        algs: Option<&[CertificateCompressionAlgorithm]>,
+        compressors: Option<&[&'static dyn CertificateCompressor]>,
     ) -> crate::Result<SslConnectorBuilder>;
 }
 
 impl SslConnectorBuilderExt for SslConnectorBuilder {
-    #[inline]
-    fn set_cert_store(mut self, store: Option<&CertStore>) -> crate::Result<SslConnectorBuilder> {
-        if let Some(store) = store {
-            store.add_to_tls(&mut self);
-        } else {
-            self.set_default_verify_paths().map_err(Error::tls)?;
-        }
-
-        Ok(self)
-    }
-
-    #[inline]
-    fn set_cert_verification(mut self, enable: bool) -> crate::Result<SslConnectorBuilder> {
-        if enable {
-            self.set_verify(SslVerifyMode::PEER);
-        } else {
-            self.set_verify(SslVerifyMode::NONE);
-        }
-        Ok(self)
-    }
-
-    #[inline]
-    fn add_certificate_compression_algorithms(
-        mut self,
-        algs: Option<&[CertificateCompressionAlgorithm]>,
-    ) -> crate::Result<SslConnectorBuilder> {
-        if let Some(algs) = algs {
-            for algorithm in algs.iter() {
-                let res =
-                    match *algorithm {
-                        CertificateCompressionAlgorithm::ZLIB => self
-                            .add_certificate_compression_algorithm(
-                                ZlibCertificateCompressor::default(),
-                            ),
-                        CertificateCompressionAlgorithm::BROTLI => self
-                            .add_certificate_compression_algorithm(
-                                BrotliCertificateCompressor::default(),
-                            ),
-                        CertificateCompressionAlgorithm::ZSTD => self
-                            .add_certificate_compression_algorithm(
-                                ZstdCertificateCompressor::default(),
-                            ),
-                        _ => continue,
-                    };
-
-                if let Err(e) = res {
-                    return Err(Error::tls(e));
-                }
+    fn set_identity(mut self, identity: Option<&Identity>) -> crate::Result<SslConnectorBuilder> {
+        if let Some(identity) = identity {
+            self.set_certificate(&identity.cert).map_err(Error::tls)?;
+            self.set_private_key(&identity.pkey).map_err(Error::tls)?;
+            for cert in identity.chain.iter() {
+                // https://www.openssl.org/docs/manmaster/man3/SSL_CTX_add_extra_chain_cert.html
+                // specifies that "When sending a certificate chain, extra chain certificates are
+                // sent in order following the end entity certificate."
+                self.add_extra_chain_cert(cert.clone())
+                    .map_err(Error::tls)?;
             }
         }
+        Ok(self)
+    }
+
+    fn set_cert_store(mut self, store: Option<&CertStore>) -> crate::Result<SslConnectorBuilder> {
+        if let Some(store) = store {
+            self.set_cert_store_ref(&store.0)
+        } else {
+            #[cfg(feature = "webpki-roots")]
+            {
+                static LOAD_CERTS: std::sync::LazyLock<CertStore> =
+                    std::sync::LazyLock::new(|| {
+                        CertStore::from_der_certs(webpki_root_certs::TLS_SERVER_ROOT_CERTS)
+                            .expect("Failed to load webpki root certificates")
+                    });
+
+                self.set_cert_store_ref(&LOAD_CERTS.0);
+            }
+
+            #[cfg(not(feature = "webpki-roots"))]
+            {
+                self.set_default_verify_paths().map_err(Error::tls)?;
+            }
+        }
+
+        Ok(self)
+    }
+
+    fn set_cert_verification(mut self, enable: bool) -> SslConnectorBuilder {
+        self.set_verify(if enable {
+            SslVerifyMode::PEER
+        } else {
+            SslVerifyMode::NONE
+        });
+
+        self
+    }
+
+    fn set_cert_compressors(
+        mut self,
+        compressors: Option<&[&'static dyn CertificateCompressor]>,
+    ) -> crate::Result<SslConnectorBuilder> {
+        if let Some(compressors) = compressors {
+            for compressor in compressors {
+                compress::register(*compressor, &mut self).map_err(Error::tls)?;
+            }
+        }
+
         Ok(self)
     }
 }

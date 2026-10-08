@@ -9,9 +9,10 @@ use std::{
     task::{Context, Poll},
 };
 
-use tower::Service;
+use futures_util::{TryFutureExt, future::MapErr};
+use tower::{BoxError, Service};
 
-use crate::error::BoxError;
+use crate::error::DnsError;
 
 /// A domain name to resolve into IP addresses.
 #[derive(Clone, Hash, Eq, PartialEq)]
@@ -74,45 +75,13 @@ pub trait Resolve: Send + Sync {
     fn resolve(&self, name: Name) -> Resolving;
 }
 
-/// Trait for converting types into a shared DNS resolver ([`Arc<dyn Resolve>`]).
-///
-/// Implemented for any [`Resolve`] type, [`Arc<T>`] where `T: Resolve`, and [`Arc<dyn Resolve>`].
-/// Enables ergonomic conversion to a trait object for use in APIs without manual Arc wrapping.
-pub trait IntoResolve {
-    /// Converts the implementor into an [`Arc<dyn Resolve>`].
+impl_into_shared!(
+    /// Trait for converting types into a shared DNS resolver ([`Arc<dyn Resolve>`]).
     ///
-    /// This method enables ergonomic conversion of concrete resolvers, [`Arc<T>`], or
-    /// existing [`Arc<dyn Resolve>`] into a trait object suitable for APIs that expect
-    /// a shared DNS resolver.
-    fn into_resolve(self) -> Arc<dyn Resolve>;
-}
-
-impl IntoResolve for Arc<dyn Resolve> {
-    #[inline]
-    fn into_resolve(self) -> Arc<dyn Resolve> {
-        self
-    }
-}
-
-impl<R> IntoResolve for Arc<R>
-where
-    R: Resolve + 'static,
-{
-    #[inline]
-    fn into_resolve(self) -> Arc<dyn Resolve> {
-        self
-    }
-}
-
-impl<R> IntoResolve for R
-where
-    R: Resolve + 'static,
-{
-    #[inline]
-    fn into_resolve(self) -> Arc<dyn Resolve> {
-        Arc::new(self)
-    }
-}
+    /// Implemented for any [`Resolve`] type, [`Arc<T>`] where `T: Resolve`, and [`Arc<dyn Resolve>`].
+    /// Enables ergonomic conversion to a trait object for use in APIs without manual Arc wrapping.
+    pub trait IntoResolve => Resolve
+);
 
 /// Adapter that wraps a [`Resolve`] trait object to work with Tower's `Service` trait.
 ///
@@ -133,14 +102,17 @@ impl DynResolver {
 impl Service<Name> for DynResolver {
     type Response = Addrs;
     type Error = BoxError;
-    type Future = Resolving;
+    type Future = MapErr<MapErr<Resolving, fn(BoxError) -> DnsError>, fn(DnsError) -> Self::Error>;
 
     fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, name: Name) -> Self::Future {
-        self.resolver.resolve(name)
+        self.resolver
+            .resolve(name)
+            .map_err(DnsError as _)
+            .map_err(Into::into)
     }
 }
 

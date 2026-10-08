@@ -4,6 +4,14 @@ use bytes::Bytes;
 
 use crate::header::{Entry, HeaderMap, HeaderValue, OccupiedEntry};
 
+/// Removes the square brackets around an IPv6 host literal as required by
+/// [RFC 3986, Section 3.2.2](https://www.rfc-editor.org/rfc/rfc3986.html#section-3.2.2).
+pub(crate) fn strip_ipv6_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 pub(crate) fn basic_auth<U, P>(username: U, password: Option<P>) -> HeaderValue
 where
     U: fmt::Display,
@@ -17,7 +25,7 @@ where
             let _ = write!(buf_str, "{password}");
         }
 
-        let encoded = boring2::base64::encode_block(buf_str.as_bytes());
+        let encoded = btls::base64::encode_block(buf_str.as_bytes());
         buf.extend(encoded.into_bytes());
         buf
     };
@@ -118,5 +126,20 @@ impl fmt::Display for Escape<'_> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_ipv6_brackets;
+
+    #[test]
+    fn strips_ipv6_brackets() {
+        assert_eq!(strip_ipv6_brackets("[::1]"), "::1");
+        assert_eq!(strip_ipv6_brackets("::1"), "::1");
+        assert_eq!(strip_ipv6_brackets("example.com"), "example.com");
+        assert_eq!(strip_ipv6_brackets("[example.com"), "[example.com");
+        assert_eq!(strip_ipv6_brackets("example.com]"), "example.com]");
+        assert_eq!(strip_ipv6_brackets("[[::1]]"), "[::1]");
     }
 }

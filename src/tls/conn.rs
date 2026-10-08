@@ -2,8 +2,6 @@
 
 #[macro_use]
 mod macros;
-mod cache;
-mod cert_compression;
 mod ext;
 mod service;
 
@@ -16,26 +14,26 @@ use std::{
     task::{Context, Poll},
 };
 
-use boring_sys2 as ffi;
-use boring2::{
+use btls::{
     error::ErrorStack,
     ex_data::Index,
     ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslSessionCacheMode},
 };
-use cache::{SessionCache, SessionKey};
-use http::Uri;
+use btls_sys as ffi;
+use ext::SslConnectorBuilderExt;
+use http::{Uri, Version};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_boring2::SslStream;
-use tower::Service;
+use tokio_btls::SslStream;
+use tower::{BoxError, Service};
 
 use crate::{
     Error,
-    client::{ConnectIdentity, ConnectRequest, Connected, Connection},
-    error::BoxError,
-    sync::Mutex,
+    conn::{Connected, Connection, descriptor::ConnectionDescriptor},
     tls::{
-        AlpnProtocol, AlpsProtocol, CertStore, Identity, KeyLog, TlsOptions, TlsVersion,
-        conn::ext::SslConnectorBuilderExt,
+        AlpnProtocol, AlpsProtocol, KeyShare, TlsOptions, TlsVersion,
+        keylog::KeyLog,
+        session::{Key, LruTlsSessionCache, TlsSession, TlsSessionCache},
+        trust::{CertStore, Identity},
     },
 };
 
@@ -66,13 +64,14 @@ pub(crate) fn encrypted_extensions_index() -> Result<Index<Ssl, Vec<u8>>, ErrorS
 /// The chain may be verifier-built or verifier-observed depending on the
 /// handshake outcome, so do not call it "verified" here. MarcoPolo validates
 /// this DER post-handshake against the scan hostname.
-pub(crate) fn captured_chain_der_index() -> Result<Index<Ssl, Vec<Vec<u8>>>, ErrorStack> {
-    static IDX: LazyLock<Result<Index<Ssl, Vec<Vec<u8>>>, ErrorStack>> =
-        LazyLock::new(Ssl::new_ex_index);
+type CapturedChainIndex = Result<Index<Ssl, Vec<Vec<u8>>>, ErrorStack>;
+
+pub(crate) fn captured_chain_der_index() -> CapturedChainIndex {
+    static IDX: LazyLock<CapturedChainIndex> = LazyLock::new(Ssl::new_ex_index);
     IDX.clone()
 }
 
-pub(crate) fn captured_chain_der_from_ssl(ssl: &boring2::ssl::SslRef) -> Option<Vec<Vec<u8>>> {
+pub(crate) fn captured_chain_der_from_ssl(ssl: &btls::ssl::SslRef) -> Option<Vec<Vec<u8>>> {
     captured_chain_der_index()
         .ok()
         .and_then(|idx| ssl.ex_data(idx).cloned())
@@ -173,7 +172,7 @@ fn store_captured_chain_der(ssl: *mut ffi::SSL, chain: Vec<Vec<u8>>) {
     // Safety: BoringSSL passes a valid SSL pointer for the duration of this
     // callback. Nothing else aliases it while we are synchronously inside
     // SSL_do_handshake.
-    let ssl_ref = unsafe { &mut *(ssl as *mut boring2::ssl::SslRef) };
+    let ssl_ref = unsafe { &mut *(ssl as *mut btls::ssl::SslRef) };
     if let Ok(idx) = captured_chain_der_index() {
         ssl_ref.set_ex_data(idx, chain);
     }
@@ -205,11 +204,11 @@ unsafe extern "C" fn server_hello_msg_callback(
         // Safety: BoringSSL passes a valid SSL pointer for the duration of
         // this callback. Nothing else aliases it while we are synchronously
         // inside SSL_do_handshake.
-        // boring2::ssl::SslRef is a transparent wrapper around ffi::SSL,
+        // btls::ssl::SslRef is a transparent wrapper around ffi::SSL,
         // so a pointer cast gives us the same &mut SslRef that
         // ForeignTypeRef::from_ptr_mut would, without pulling in
         // foreign_types as a direct dependency.
-        let ssl_ref = unsafe { &mut *(ssl as *mut boring2::ssl::SslRef) };
+        let ssl_ref = unsafe { &mut *(ssl as *mut btls::ssl::SslRef) };
         if let Ok(idx) = server_hello_index() {
             ssl_ref.set_ex_data(idx, hello_body);
         }
@@ -219,14 +218,14 @@ unsafe extern "C" fn server_hello_msg_callback(
         } else {
             data.to_vec()
         };
-        let ssl_ref = unsafe { &mut *(ssl as *mut boring2::ssl::SslRef) };
+        let ssl_ref = unsafe { &mut *(ssl as *mut btls::ssl::SslRef) };
         if let Ok(idx) = encrypted_extensions_index() {
             ssl_ref.set_ex_data(idx, ee_body);
         }
-    } else if data[0] == 0x0b {
-        if let Some(chain) = parse_certificate_message_der(data) {
-            store_captured_chain_der(ssl, chain);
-        }
+    } else if data[0] == 0x0b
+        && let Some(chain) = parse_certificate_message_der(data)
+    {
+        store_captured_chain_der(ssl, chain);
     }
 }
 
@@ -289,21 +288,14 @@ mod cert_message_tests {
     }
 }
 
-type KeyIndexResult = Result<Index<Ssl, SessionKey<ConnectIdentity>>, ErrorStack>;
-
-fn key_index() -> KeyIndexResult {
-    static IDX: LazyLock<KeyIndexResult> = LazyLock::new(Ssl::new_ex_index);
+fn key_index() -> Result<Index<Ssl, Key>, ErrorStack> {
+    static IDX: LazyLock<Result<Index<Ssl, Key>, ErrorStack>> = LazyLock::new(Ssl::new_ex_index);
     IDX.clone()
-}
-
-/// Builds for [`HandshakeConfig`].
-pub struct HandshakeConfigBuilder {
-    settings: HandshakeConfig,
 }
 
 /// Settings for [`TlsConnector`]
 #[derive(Clone)]
-pub struct HandshakeConfig {
+pub struct HandshakeSettings {
     no_ticket: bool,
     enable_ech_grease: bool,
     verify_hostname: bool,
@@ -311,112 +303,19 @@ pub struct HandshakeConfig {
     alpn_protocols: Option<Cow<'static, [AlpnProtocol]>>,
     alps_protocols: Option<Cow<'static, [AlpsProtocol]>>,
     alps_use_new_codepoint: bool,
+    key_shares: Option<Cow<'static, [KeyShare]>>,
     random_aes_hw_override: bool,
-}
-
-impl HandshakeConfigBuilder {
-    /// Skips the session ticket.
-    pub fn no_ticket(mut self, skip: bool) -> Self {
-        self.settings.no_ticket = skip;
-        self
-    }
-
-    /// Enables or disables ECH grease.
-    pub fn enable_ech_grease(mut self, enable: bool) -> Self {
-        self.settings.enable_ech_grease = enable;
-        self
-    }
-
-    /// Sets hostname verification.
-    pub fn verify_hostname(mut self, verify: bool) -> Self {
-        self.settings.verify_hostname = verify;
-        self
-    }
-
-    /// Sets TLS SNI.
-    pub fn tls_sni(mut self, sni: bool) -> Self {
-        self.settings.tls_sni = sni;
-        self
-    }
-
-    /// Sets ALPN protocols.
-    pub fn alpn_protocols<P>(mut self, alpn_protocols: P) -> Self
-    where
-        P: Into<Option<Cow<'static, [AlpnProtocol]>>>,
-    {
-        self.settings.alpn_protocols = alpn_protocols.into();
-        self
-    }
-
-    /// Sets ALPS protocol.
-    pub fn alps_protocols<P>(mut self, alps_protocols: P) -> Self
-    where
-        P: Into<Option<Cow<'static, [AlpsProtocol]>>>,
-    {
-        self.settings.alps_protocols = alps_protocols.into();
-        self
-    }
-
-    /// Sets ALPS new codepoint usage.
-    pub fn alps_use_new_codepoint(mut self, use_new: bool) -> Self {
-        self.settings.alps_use_new_codepoint = use_new;
-        self
-    }
-
-    /// Sets random AES hardware override.
-    pub fn random_aes_hw_override(mut self, override_: bool) -> Self {
-        self.settings.random_aes_hw_override = override_;
-        self
-    }
-
-    /// Builds the `HandshakeConfig`.
-    pub fn build(self) -> HandshakeConfig {
-        self.settings
-    }
-}
-
-impl HandshakeConfig {
-    /// Creates a new `HandshakeConfigBuilder`.
-    pub fn builder() -> HandshakeConfigBuilder {
-        HandshakeConfigBuilder {
-            settings: HandshakeConfig::default(),
-        }
-    }
-}
-
-impl Default for HandshakeConfig {
-    fn default() -> Self {
-        Self {
-            no_ticket: false,
-            enable_ech_grease: false,
-            verify_hostname: true,
-            tls_sni: true,
-            alpn_protocols: None,
-            alps_protocols: None,
-            alps_use_new_codepoint: false,
-            random_aes_hw_override: false,
-        }
-    }
 }
 
 /// A Connector using BoringSSL to support `http` and `https` schemes.
 #[derive(Clone)]
 pub struct HttpsConnector<T> {
     http: T,
-    inner: Inner,
-}
-
-#[derive(Clone)]
-struct Inner {
-    ssl: SslConnector,
-    cache: Option<Arc<Mutex<SessionCache<ConnectIdentity>>>>,
-    config: HandshakeConfig,
+    tls: TlsConnector,
 }
 
 /// A builder for creating a `TlsConnector`.
-#[derive(Clone)]
 pub struct TlsConnectorBuilder {
-    session_cache: Arc<Mutex<SessionCache<ConnectIdentity>>>,
     alpn_protocol: Option<AlpnProtocol>,
     max_version: Option<TlsVersion>,
     min_version: Option<TlsVersion>,
@@ -426,12 +325,15 @@ pub struct TlsConnectorBuilder {
     cert_store: Option<CertStore>,
     cert_verification: bool,
     keylog: Option<KeyLog>,
+    session_cache: Arc<dyn TlsSessionCache>,
 }
 
 /// A layer which wraps services in an `SslConnector`.
 #[derive(Clone)]
 pub struct TlsConnector {
-    inner: Inner,
+    ssl: SslConnector,
+    cache: Option<Arc<dyn TlsSessionCache>>,
+    settings: HandshakeSettings,
 }
 
 // ===== impl HttpsConnector =====
@@ -445,24 +347,37 @@ where
 {
     /// Creates a new [`HttpsConnector`] with a given [`TlsConnector`].
     #[inline]
-    pub fn with_connector(http: S, connector: TlsConnector) -> HttpsConnector<S> {
-        HttpsConnector {
-            http,
-            inner: connector.inner,
-        }
+    pub fn new(http: S, tls: TlsConnector) -> HttpsConnector<S> {
+        HttpsConnector { http, tls }
     }
 
     /// Disables ALPN negotiation.
     #[inline]
     pub fn no_alpn(&mut self) -> &mut Self {
-        self.inner.config.alpn_protocols = None;
+        self.tls.settings.alpn_protocols = None;
         self
     }
 }
 
-// ===== impl Inner =====
+// ===== impl TlsConnector =====
 
-impl Inner {
+impl TlsConnector {
+    /// Creates a new [`TlsConnectorBuilder`] with the given configuration.
+    pub fn builder() -> TlsConnectorBuilder {
+        TlsConnectorBuilder {
+            alpn_protocol: None,
+            min_version: None,
+            max_version: None,
+            identity: None,
+            tls_sni: true,
+            verify_hostname: true,
+            cert_store: None,
+            cert_verification: true,
+            keylog: None,
+            session_cache: Arc::new(LruTlsSessionCache::new(8)),
+        }
+    }
+
     fn setup_ssl(&self, uri: Uri) -> Result<Ssl, BoxError> {
         let cfg = self.ssl.configure()?;
         let host = uri.host().ok_or("URI missing host")?;
@@ -471,63 +386,80 @@ impl Inner {
         Ok(ssl)
     }
 
-    fn setup_ssl2(&self, req: ConnectRequest) -> Result<Ssl, BoxError> {
+    fn setup_ssl2(&self, descriptor: ConnectionDescriptor) -> Result<Ssl, BoxError> {
         let mut cfg = self.ssl.configure()?;
 
         // Use server name indication
-        cfg.set_use_server_name_indication(self.config.tls_sni);
+        cfg.set_use_server_name_indication(self.settings.tls_sni);
 
         // Verify hostname
-        cfg.set_verify_hostname(self.config.verify_hostname);
+        cfg.set_verify_hostname(self.settings.verify_hostname);
 
         // Set ECH grease
-        cfg.set_enable_ech_grease(self.config.enable_ech_grease);
+        cfg.set_enable_ech_grease(self.settings.enable_ech_grease);
 
         // Set random AES hardware override
-        if self.config.random_aes_hw_override {
+        if self.settings.random_aes_hw_override {
             let random = (crate::util::fast_random() & 1) == 0;
             cfg.set_aes_hw_override(random);
         }
 
-        // Set ALPS protos
-        if let Some(ref alps_values) = self.config.alps_protocols {
-            for alps in alps_values.iter() {
-                cfg.add_application_settings(alps.0)?;
-            }
-
-            // By default, the old endpoint is used.
-            if !alps_values.is_empty() && self.config.alps_use_new_codepoint {
-                cfg.set_alps_use_new_codepoint(true);
-            }
-        }
-
         // Set ALPN protocols
-        if let Some(alpn) = req.extra().alpn_protocol() {
-            // If ALPN is set in the request, it takes precedence over the connector configuration.
-            cfg.set_alpn_protos(&alpn.encode())?;
+        if let Some(version) = descriptor.version() {
+            match version {
+                Version::HTTP_11 | Version::HTTP_10 | Version::HTTP_09 => {
+                    cfg.set_alpn_protos(&AlpnProtocol::HTTP1.encode())?;
+                }
+                Version::HTTP_2 => {
+                    cfg.set_alpn_protos(&AlpnProtocol::HTTP2.encode())?;
+                }
+                Version::HTTP_3 => {
+                    cfg.set_alpn_protos(&AlpnProtocol::HTTP3.encode())?;
+                }
+                _ => {
+                    // For unknown versions, we don't set any ALPN protocols.
+                }
+            }
         } else {
             // Default use the connector configuration.
-            if let Some(ref alpn_values) = self.config.alpn_protocols {
+            if let Some(ref alpn_values) = self.settings.alpn_protocols {
                 let encoded = AlpnProtocol::encode_sequence(alpn_values.as_ref());
                 cfg.set_alpn_protos(&encoded)?;
             }
         }
 
-        let uri = req.uri().clone();
+        // Set ALPS protos
+        if let Some(ref alps_values) = self.settings.alps_protocols {
+            for alps in alps_values.iter() {
+                cfg.add_application_settings(alps.0)?;
+            }
+
+            // By default, the new endpoint is used.
+            if !alps_values.is_empty() {
+                cfg.set_alps_use_new_codepoint(self.settings.alps_use_new_codepoint);
+            }
+        }
+
+        // Set TLS key shares
+        if let Some(ref key_shares) = self.settings.key_shares {
+            cfg.set_client_key_shares(key_shares.as_ref())?;
+        }
+
+        let uri = descriptor.uri().clone();
         let host = uri.host().ok_or("URI missing host")?;
         let host = Self::normalize_host(host);
 
         if let Some(ref cache) = self.cache {
-            let key = SessionKey(req.identify());
+            let key = Key(descriptor.id());
 
             // If the session cache is enabled, we try to retrieve the session
             // associated with the key. If it exists, we set it in the SSL configuration.
-            if let Some(session) = cache.lock().get(&key) {
+            if let Some(session) = cache.pop(&key) {
                 #[allow(unsafe_code)]
-                unsafe { cfg.set_session(&session) }?;
+                unsafe { cfg.set_session(&session.0) }?;
 
-                if self.config.no_ticket {
-                    cfg.set_options(SslOptions::NO_TICKET)?;
+                if self.settings.no_ticket {
+                    cfg.set_options(SslOptions::NO_TICKET);
                 }
             }
 
@@ -535,25 +467,16 @@ impl Inner {
             cfg.set_ex_data(idx, key);
         }
 
-        let ssl = cfg.into_ssl(host)?;
-        Ok(ssl)
+        Ok(cfg.into_ssl(host)?)
     }
 
     /// If `host` is an IPv6 address, we must strip away the square brackets that surround
     /// it (otherwise, boring will fail to parse the host as an IP address, eventually
     /// causing the handshake to fail due a hostname verification error).
     fn normalize_host(host: &str) -> &str {
-        if host.is_empty() {
-            return host;
-        }
-
-        let last = host.len() - 1;
-        let mut chars = host.chars();
-
-        if let (Some('['), Some(']')) = (chars.next(), chars.last()) {
-            if host[1..last].parse::<std::net::Ipv6Addr>().is_ok() {
-                return &host[1..last];
-            }
+        let normalized = crate::util::strip_ipv6_brackets(host);
+        if normalized.len() != host.len() && normalized.parse::<std::net::Ipv6Addr>().is_ok() {
+            return normalized;
         }
 
         host
@@ -564,28 +487,28 @@ impl Inner {
 
 impl TlsConnectorBuilder {
     /// Sets the alpn protocol to be used.
-    #[inline(always)]
+    #[inline]
     pub fn alpn_protocol(mut self, protocol: Option<AlpnProtocol>) -> Self {
         self.alpn_protocol = protocol;
         self
     }
 
     /// Sets the TLS keylog policy.
-    #[inline(always)]
+    #[inline]
     pub fn keylog(mut self, keylog: Option<KeyLog>) -> Self {
         self.keylog = keylog;
         self
     }
 
     /// Sets the identity to be used for client certificate authentication.
-    #[inline(always)]
+    #[inline]
     pub fn identity(mut self, identity: Option<Identity>) -> Self {
         self.identity = identity;
         self
     }
 
     /// Sets the certificate store used for TLS verification.
-    #[inline(always)]
+    #[inline]
     pub fn cert_store<T>(mut self, cert_store: T) -> Self
     where
         T: Into<Option<CertStore>>,
@@ -595,14 +518,14 @@ impl TlsConnectorBuilder {
     }
 
     /// Sets the certificate verification flag.
-    #[inline(always)]
+    #[inline]
     pub fn cert_verification(mut self, enabled: bool) -> Self {
         self.cert_verification = enabled;
         self
     }
 
     /// Sets the minimum TLS version to use.
-    #[inline(always)]
+    #[inline]
     pub fn min_version<T>(mut self, version: T) -> Self
     where
         T: Into<Option<TlsVersion>>,
@@ -612,7 +535,7 @@ impl TlsConnectorBuilder {
     }
 
     /// Sets the maximum TLS version to use.
-    #[inline(always)]
+    #[inline]
     pub fn max_version<T>(mut self, version: T) -> Self
     where
         T: Into<Option<TlsVersion>>,
@@ -622,21 +545,35 @@ impl TlsConnectorBuilder {
     }
 
     /// Sets the Server Name Indication (SNI) flag.
-    #[inline(always)]
+    #[inline]
     pub fn tls_sni(mut self, enabled: bool) -> Self {
         self.tls_sni = enabled;
         self
     }
 
     /// Sets the hostname verification flag.
-    #[inline(always)]
+    #[inline]
     pub fn verify_hostname(mut self, enabled: bool) -> Self {
         self.verify_hostname = enabled;
         self
     }
 
+    /// Sets a custom TLS session store.
+    #[inline]
+    pub fn session_store(mut self, store: Option<Arc<dyn TlsSessionCache>>) -> Self {
+        if let Some(store) = store {
+            self.session_cache = store;
+        }
+        self
+    }
+
     /// Build the `TlsConnector` with the provided configuration.
-    pub fn build(&self, opts: &TlsOptions) -> crate::Result<TlsConnector> {
+    pub fn build<'a, T>(&self, opts: T) -> crate::Result<TlsConnector>
+    where
+        T: Into<Cow<'a, TlsOptions>>,
+    {
+        let opts = opts.into();
+
         // Replace the default configuration with the provided one
         let max_tls_version = opts.max_tls_version.or(self.max_version);
         let min_tls_version = opts.min_tls_version.or(self.min_version);
@@ -646,18 +583,12 @@ impl TlsConnectorBuilder {
             .or_else(|| opts.alpn_protocols.clone());
 
         // Create the SslConnector with the provided options
-        let mut connector = SslConnector::no_default_verify_builder(SslMethod::tls_client())
+        let mut connector = SslConnector::bare_builder(SslMethod::tls())
             .map_err(Error::tls)?
+            .set_identity(self.identity.as_ref())?
             .set_cert_store(self.cert_store.as_ref())?
-            .set_cert_verification(self.cert_verification)?
-            .add_certificate_compression_algorithms(
-                opts.certificate_compression_algorithms.as_deref(),
-            )?;
-
-        // Set Identity
-        if let Some(ref identity) = self.identity {
-            identity.add_to_tls(&mut connector)?;
-        }
+            .set_cert_verification(self.cert_verification)
+            .set_cert_compressors(opts.certificate_compressors.as_deref())?;
 
         // Set minimum TLS version
         set_option_inner_try!(min_tls_version, connector, set_min_proto_version);
@@ -737,9 +668,6 @@ impl TlsConnectorBuilder {
         // Set TLS record size limit
         set_option!(opts, record_size_limit, connector, set_record_size_limit);
 
-        // Set TLS key shares limit
-        set_option!(opts, key_shares_limit, connector, set_key_shares_limit);
-
         // Set TLS aes hardware override
         set_option!(opts, aes_hw_override, connector, set_aes_hw_override);
 
@@ -758,77 +686,47 @@ impl TlsConnectorBuilder {
             });
         }
 
-        // Create the handshake config with the default session cache capacity.
-        let config = HandshakeConfig::builder()
-            .no_ticket(opts.psk_skip_session_ticket)
-            .alpn_protocols(alpn_protocols)
-            .alps_protocols(opts.alps_protocols.clone())
-            .alps_use_new_codepoint(opts.alps_use_new_codepoint)
-            .enable_ech_grease(opts.enable_ech_grease)
-            .tls_sni(self.tls_sni)
-            .verify_hostname(self.verify_hostname)
-            .random_aes_hw_override(opts.random_aes_hw_override)
-            .build();
+        // Create the handshake settings with the default session cache capacity.
+        let settings = HandshakeSettings {
+            tls_sni: self.tls_sni,
+            verify_hostname: self.verify_hostname,
+            no_ticket: opts.psk_skip_session_ticket,
+            alpn_protocols,
+            alps_protocols: opts.alps_protocols.clone(),
+            alps_use_new_codepoint: opts.alps_use_new_codepoint,
+            enable_ech_grease: opts.enable_ech_grease,
+            key_shares: opts.key_shares.clone(),
+            random_aes_hw_override: opts.random_aes_hw_override,
+        };
 
         // If the session cache is disabled, we don't need to set up any callbacks.
         let cache = opts.pre_shared_key.then(|| {
-            let cache = self.session_cache.clone();
+            let session_cache = self.session_cache.clone();
 
             connector.set_session_cache_mode(SslSessionCacheMode::CLIENT);
             connector.set_new_session_callback({
-                let cache = cache.clone();
+                let cache = session_cache.clone();
                 move |ssl, session| {
                     if let Ok(Some(key)) = key_index().map(|idx| ssl.ex_data(idx)) {
-                        cache.lock().insert(key.clone(), session);
+                        cache.put(key.clone(), TlsSession(session));
                     }
                 }
             });
 
-            cache
+            session_cache
         });
 
-        // Set msg_callback to capture ServerHello bytes for JA4s fingerprinting.
+        // Capture evidence without replacing BoringSSL certificate verification.
         #[allow(unsafe_code)]
         unsafe {
             ffi::SSL_CTX_set_msg_callback(connector.as_ptr(), Some(server_hello_msg_callback));
         }
 
-        // Certificate DER is captured in `server_hello_msg_callback` from the
-        // raw server Certificate handshake message. Do not install a custom
-        // verify callback here: BoringSSL custom verification replaces the
-        // normal verifier, so returning Ok(()) would silently disable
-        // `cert_verification(true)` for non-MarcoPolo callers.
-
         Ok(TlsConnector {
-            inner: Inner {
-                ssl: connector.build(),
-                cache,
-                config,
-            },
+            ssl: connector.build(),
+            cache,
+            settings,
         })
-    }
-}
-
-// ===== impl TlsConnector =====
-
-impl TlsConnector {
-    /// Creates a new `TlsConnectorBuilder` with the given configuration.
-    pub fn builder() -> TlsConnectorBuilder {
-        const DEFAULT_SESSION_CACHE_CAPACITY: usize = 8;
-        TlsConnectorBuilder {
-            session_cache: Arc::new(Mutex::new(SessionCache::with_capacity(
-                DEFAULT_SESSION_CACHE_CAPACITY,
-            ))),
-            alpn_protocol: None,
-            min_version: None,
-            max_version: None,
-            identity: None,
-            cert_store: None,
-            cert_verification: true,
-            tls_sni: true,
-            verify_hostname: true,
-            keylog: None,
-        }
     }
 }
 
@@ -843,18 +741,30 @@ pub enum MaybeHttpsStream<T> {
 /// A connection that has been established with a TLS handshake.
 pub struct EstablishedConn<IO> {
     io: IO,
-    req: ConnectRequest,
+    descriptor: ConnectionDescriptor,
 }
 
 // ===== impl MaybeHttpsStream =====
 
-impl<T> MaybeHttpsStream<T> {
-    /// Returns a reference to the underlying stream.
+impl<T> AsRef<T> for MaybeHttpsStream<T> {
     #[inline]
-    pub fn get_ref(&self) -> &T {
+    fn as_ref(&self) -> &T {
         match self {
             MaybeHttpsStream::Http(s) => s,
             MaybeHttpsStream::Https(s) => s.get_ref(),
+        }
+    }
+}
+
+impl<T> Connection for MaybeHttpsStream<T>
+where
+    T: Connection,
+{
+    #[inline]
+    fn connected(&self) -> Connected {
+        match self {
+            MaybeHttpsStream::Http(s) => s.connected(),
+            MaybeHttpsStream::Https(s) => s.get_ref().connected(),
         }
     }
 }
@@ -868,30 +778,11 @@ impl<T> fmt::Debug for MaybeHttpsStream<T> {
     }
 }
 
-impl<T> Connection for MaybeHttpsStream<T>
-where
-    T: Connection,
-{
-    fn connected(&self) -> Connected {
-        match self {
-            MaybeHttpsStream::Http(s) => s.connected(),
-            MaybeHttpsStream::Https(s) => {
-                let mut connected = s.get_ref().connected();
-
-                if s.ssl().selected_alpn_protocol() == Some(b"h2") {
-                    connected = connected.negotiated_h2();
-                }
-
-                connected
-            }
-        }
-    }
-}
-
 impl<T> AsyncRead for MaybeHttpsStream<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    #[inline]
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -908,6 +799,7 @@ impl<T> AsyncWrite for MaybeHttpsStream<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    #[inline]
     fn poll_write(
         mut self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -919,6 +811,7 @@ where
         }
     }
 
+    #[inline]
     fn poll_flush(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.as_mut().get_mut() {
             MaybeHttpsStream::Http(inner) => Pin::new(inner).poll_flush(ctx),
@@ -926,10 +819,31 @@ where
         }
     }
 
+    #[inline]
     fn poll_shutdown(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.as_mut().get_mut() {
             MaybeHttpsStream::Http(inner) => Pin::new(inner).poll_shutdown(ctx),
             MaybeHttpsStream::Https(inner) => Pin::new(inner).poll_shutdown(ctx),
+        }
+    }
+
+    #[inline]
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            MaybeHttpsStream::Http(inner) => inner.is_write_vectored(),
+            MaybeHttpsStream::Https(inner) => inner.is_write_vectored(),
+        }
+    }
+
+    #[inline]
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            MaybeHttpsStream::Http(inner) => Pin::new(inner).poll_write_vectored(cx, bufs),
+            MaybeHttpsStream::Https(inner) => Pin::new(inner).poll_write_vectored(cx, bufs),
         }
     }
 }
@@ -939,7 +853,7 @@ where
 impl<IO> EstablishedConn<IO> {
     /// Creates a new [`EstablishedConn`].
     #[inline]
-    pub fn new(io: IO, req: ConnectRequest) -> EstablishedConn<IO> {
-        EstablishedConn { io, req }
+    pub fn new(io: IO, descriptor: ConnectionDescriptor) -> EstablishedConn<IO> {
+        EstablishedConn { io, descriptor }
     }
 }

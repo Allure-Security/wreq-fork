@@ -727,10 +727,7 @@ async fn http1_only() {
 
     assert_eq!(resp.version(), wreq::Version::HTTP_11);
 
-    let resp = Client::builder()
-        .build()
-        .unwrap()
-        .get(format!("http://{}", server.addr()))
+    let resp = wreq::get(format!("http://{}", server.addr()))
         .version(Version::HTTP_11)
         .send()
         .await
@@ -754,10 +751,7 @@ async fn http2_only() {
 
     assert_eq!(resp.version(), wreq::Version::HTTP_2);
 
-    let resp = Client::builder()
-        .build()
-        .unwrap()
-        .get(format!("http://{}", server.addr()))
+    let resp = wreq::get(format!("http://{}", server.addr()))
         .version(Version::HTTP_2)
         .send()
         .await
@@ -809,7 +803,7 @@ async fn http1_send_case_sensitive_headers() {
     orig_headers.insert("X-custom-header");
     orig_headers.insert("Host");
 
-    let resp = wreq::get("https://tls.peet.ws/api/all")
+    let resp = wreq::get("https://tls.browserleaks.com")
         .header("X-Custom-Header", "value")
         .orig_headers(orig_headers)
         .version(Version::HTTP_11)
@@ -1095,4 +1089,28 @@ async fn response_trailers() {
     assert_eq!(body, "HelloWorld!");
     assert_eq!(trailers["chunky-trailer1"], "value1");
     assert_eq!(trailers["chunky-trailer2"], "value2");
+}
+
+#[tokio::test]
+async fn dns_resolution_failure_is_dns_error() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    struct FailingResolver;
+
+    impl wreq::dns::Resolve for FailingResolver {
+        fn resolve(&self, _name: wreq::dns::Name) -> reqwest::dns::Resolving {
+            Box::pin(async { Err("simulated resolver failure".into()) })
+        }
+    }
+
+    let client = Client::builder()
+        .no_proxy()
+        .dns_resolver(FailingResolver)
+        .build()
+        .expect("client builder");
+
+    let err = client.get("http://hyper.rs").send().await.unwrap_err();
+
+    assert!(err.is_dns(), "expected a DNS error, got: {err:?}");
+    assert!(err.is_connect(), "expected is_connect() to also be true");
 }

@@ -6,16 +6,16 @@
 
 use std::{borrow::Cow, error::Error as StdError, fmt, sync::Arc};
 
-use bytes::Bytes;
 use futures_util::FutureExt;
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
+use http::{HeaderMap, HeaderName, StatusCode, Uri};
 
+use self::referrer::Referrer;
 use crate::{
-    client::{Body, layer::redirect},
+    client::layer::redirect,
     config::RequestConfig,
     error::{BoxError, Error},
     ext::UriExt,
-    header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, REFERER, WWW_AUTHENTICATE},
+    header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, WWW_AUTHENTICATE},
 };
 
 /// A type that controls the policy on how to handle the following of redirects.
@@ -52,9 +52,7 @@ pub struct Attempt<'a, const PENDING: bool = true> {
 
 /// An action to perform when a redirect status code is found.
 #[derive(Debug)]
-pub struct Action {
-    inner: redirect::Action,
-}
+pub struct Action(redirect::Action);
 
 /// Redirect history information for a response.
 #[derive(Debug, Clone)]
@@ -90,17 +88,17 @@ struct TooManyRedirects;
 /// A redirect policy handler for HTTP clients.
 ///
 /// [`FollowRedirectPolicy`] manages how HTTP redirects are handled by the client,
-/// including the maximum number of redirects, whether to set the `Referer` header,
+/// including the maximum number of redirects, `Referer` policy handling,
 /// HTTPS-only enforcement, and redirect history tracking.
 ///
 /// This type is used internally by the client to implement redirect logic according to
 /// the configured [`Policy`]. It ensures that only allowed redirects are followed,
-/// sensitive headers are removed when crossing hosts, and the `Referer` header is set
-/// when appropriate.
+/// sensitive headers are removed when crossing origins, and response referrer policies
+/// are applied.
 #[derive(Clone)]
 pub(crate) struct FollowRedirectPolicy {
     policy: RequestConfig<Policy>,
-    referer: bool,
+    referrer: Option<Referrer>,
     uris: Vec<Uri>,
     https_only: bool,
     history: Option<Vec<HistoryEntry>>,
@@ -221,7 +219,7 @@ impl Policy {
             uri: Cow::Borrowed(next),
             previous: Cow::Borrowed(previous),
         })
-        .inner
+        .0
     }
 }
 
@@ -241,9 +239,7 @@ impl<const PENDING: bool> Attempt<'_, PENDING> {
     /// Returns an action meaning wreq should follow the next URI.
     #[inline]
     pub fn follow(self) -> Action {
-        Action {
-            inner: redirect::Action::Follow,
-        }
+        Action(redirect::Action::Follow)
     }
 
     /// Returns an action meaning wreq should not follow the next URI.
@@ -251,9 +247,7 @@ impl<const PENDING: bool> Attempt<'_, PENDING> {
     /// The 30x response will be returned as the `Ok` result.
     #[inline]
     pub fn stop(self) -> Action {
-        Action {
-            inner: redirect::Action::Stop,
-        }
+        Action(redirect::Action::Stop)
     }
 
     /// Returns an [`Action`] failing the redirect with an error.
@@ -261,9 +255,7 @@ impl<const PENDING: bool> Attempt<'_, PENDING> {
     /// The [`Error`] will be returned for the result of the sent request.
     #[inline]
     pub fn error<E: Into<BoxError>>(self, error: E) -> Action {
-        Action {
-            inner: redirect::Action::Error(error.into()),
-        }
+        Action(redirect::Action::Error(error.into()))
     }
 }
 
@@ -300,10 +292,10 @@ impl Attempt<'_, true> {
             uri: Cow::Owned(self.uri.into_owned()),
             previous: Cow::Owned(self.previous.into_owned()),
         };
-        let pending = Box::pin(func(attempt).map(|action| action.inner));
-        Action {
-            inner: redirect::Action::Pending(pending),
-        }
+
+        Action(redirect::Action::Pending(Box::pin(
+            func(attempt).map(|action| action.0),
+        )))
     }
 }
 
@@ -356,9 +348,9 @@ impl StdError for TooManyRedirects {}
 impl FollowRedirectPolicy {
     /// Creates a new redirect policy handler with the given [`Policy`].
     pub fn new(policy: Policy) -> Self {
-        Self {
+        FollowRedirectPolicy {
             policy: RequestConfig::new(Some(policy)),
-            referer: false,
+            referrer: None,
             uris: Vec::new(),
             https_only: false,
             history: None,
@@ -368,7 +360,7 @@ impl FollowRedirectPolicy {
     /// Enables or disables automatic Referer header management.
     #[inline]
     pub fn with_referer(mut self, referer: bool) -> Self {
-        self.referer = referer;
+        self.referrer = referer.then(Referrer::default);
         self
     }
 
@@ -380,111 +372,505 @@ impl FollowRedirectPolicy {
     }
 }
 
-impl redirect::Policy<Body, BoxError> for FollowRedirectPolicy {
-    fn redirect(&mut self, attempt: redirect::Attempt<'_>) -> Result<redirect::Action, BoxError> {
+impl FollowRedirectPolicy {
+    pub(crate) fn redirect(
+        &mut self,
+        attempt: redirect::Attempt<'_>,
+    ) -> Result<redirect::Action, BoxError> {
         // Parse the next URI from the attempt.
         let previous_uri = attempt.previous;
         let next_uri = attempt.location;
-
-        // Push the previous URI to the list of URLs.
         self.uris.push(previous_uri.clone());
+        if let Some(referrer) = &mut self.referrer {
+            referrer.on_redirect(attempt.headers);
+        }
 
         // Get policy from config
         let policy = self
             .policy
             .as_ref()
             .expect("[BUG] FollowRedirectPolicy should always have a policy set");
+        let action = policy.check(attempt.status, attempt.headers, next_uri, &self.uris);
 
-        // Check if the next URI is already in the list of URLs.
-        match policy.check(attempt.status, attempt.headers, next_uri, &self.uris) {
-            redirect::Action::Follow => {
-                // Validate the redirect URI scheme
-                if !(next_uri.is_http() || next_uri.is_https()) {
-                    return Err(Error::uri_bad_scheme(next_uri.clone()).into());
-                }
-
-                // Check HTTPS-only policy
-                if self.https_only && !next_uri.is_https() {
-                    return Err(Error::redirect(
-                        Error::uri_bad_scheme(next_uri.clone()),
-                        next_uri.clone(),
-                    )
-                    .into());
-                }
-
-                // Record redirect history
-                if !matches!(policy.inner, PolicyKind::None) {
-                    self.history.get_or_insert_default().push(HistoryEntry {
-                        status: attempt.status,
-                        uri: attempt.location.clone(),
-                        previous: attempt.previous.clone(),
-                        headers: attempt.headers.clone(),
-                    });
-                }
-
-                Ok(redirect::Action::Follow)
-            }
-            redirect::Action::Stop => Ok(redirect::Action::Stop),
-            redirect::Action::Pending(task) => Ok(redirect::Action::Pending(task)),
-            redirect::Action::Error(err) => Err(Error::redirect(err, previous_uri.clone()).into()),
+        // Handle errors from the policy immediately
+        if let redirect::Action::Error(err) = action {
+            return Err(Error::redirect(err, previous_uri.clone()).into());
         }
+
+        // Handle follow redirect action
+        if matches!(&action, redirect::Action::Follow) {
+            // Validate the redirect URI scheme
+            if !(next_uri.is_http() || next_uri.is_https()) {
+                return Err(Error::uri_bad_scheme(next_uri.clone()).into());
+            }
+
+            // Check HTTPS-only policy
+            if self.https_only && !next_uri.is_https() {
+                return Err(Error::redirect(
+                    Error::uri_bad_scheme(next_uri.clone()),
+                    next_uri.clone(),
+                )
+                .into());
+            }
+
+            // Record redirect history
+            if !matches!(policy.inner, PolicyKind::None) {
+                self.history.get_or_insert_default().push(HistoryEntry {
+                    status: attempt.status,
+                    uri: attempt.location.clone(),
+                    previous: attempt.previous.clone(),
+                    headers: attempt.headers.clone(),
+                });
+            }
+        }
+
+        Ok(action)
     }
 
-    fn follow_redirects(&mut self, request: &mut http::Request<Body>) -> bool {
+    pub(crate) fn for_request<B>(&mut self, request: &mut http::Request<B>) -> Option<Self> {
         self.policy
             .load(request.extensions_mut())
             .is_some_and(|policy| !matches!(policy.inner, PolicyKind::None))
+            .then(|| {
+                let mut policy = self.clone();
+                policy.referrer = policy.referrer.map(|_| Referrer::new(request.headers()));
+                policy
+            })
     }
 
-    fn on_request(&mut self, req: &mut http::Request<Body>) {
-        let next_url = req.uri().clone();
-        remove_sensitive_headers(req.headers_mut(), &next_url, &self.uris);
-        if self.referer {
-            if let Some(previous_url) = self.uris.last() {
-                if let Some(v) = make_referer(next_url, previous_url) {
-                    req.headers_mut().insert(REFERER, v);
-                }
-            }
+    pub(crate) fn on_request<B>(&mut self, req: &mut http::Request<B>) {
+        remove_sensitive_headers(req, &self.uris);
+        if !self.uris.is_empty()
+            && let Some(referrer) = &mut self.referrer
+        {
+            referrer.apply(req);
         }
     }
 
-    fn on_response<Body>(&mut self, response: &mut http::Response<Body>) {
+    pub(crate) fn on_response<B>(&mut self, response: &mut http::Response<B>) {
         if let Some(history) = self.history.take() {
             response.extensions_mut().insert(History(history));
         }
     }
+}
 
-    #[inline]
-    fn clone_body(&self, body: &Body) -> Option<Body> {
-        body.try_clone()
+fn remove_sensitive_headers<B>(req: &mut http::Request<B>, previous: &[Uri]) {
+    if let Some(previous) = previous.last()
+        && !same_origin(req.uri(), previous)
+    {
+        /// Avoid dynamic allocation of `HeaderName` by using `from_static`.
+        /// https://github.com/hyperium/http/blob/e9de46c9269f0a476b34a02a401212e20f639df2/src/header/map.rs#L3794
+        const COOKIE2: HeaderName = HeaderName::from_static("cookie2");
+        let headers = req.headers_mut();
+        headers.remove(AUTHORIZATION);
+        headers.remove(COOKIE);
+        headers.remove(COOKIE2);
+        headers.remove(PROXY_AUTHORIZATION);
+        headers.remove(WWW_AUTHENTICATE);
     }
 }
 
-fn make_referer(next: Uri, previous: &Uri) -> Option<HeaderValue> {
-    if next.is_http() && previous.is_https() {
-        return None;
-    }
+fn same_origin(left: &Uri, right: &Uri) -> bool {
+    let same_host = match (left.host(), right.host()) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        (None, None) => true,
+        _ => false,
+    };
 
-    let mut referer = previous.clone();
-    referer.set_userinfo("", None);
-    HeaderValue::from_maybe_shared(Bytes::from(referer.to_string())).ok()
+    same_host
+        && left.scheme() == right.scheme()
+        && left.port_or_default() == right.port_or_default()
 }
 
-fn remove_sensitive_headers(headers: &mut HeaderMap, next: &Uri, previous: &[Uri]) {
-    if let Some(previous) = previous.last() {
-        let cross_host = next.host() != previous.host()
-            || next.port() != previous.port()
-            || next.scheme() != previous.scheme();
-        if cross_host {
-            /// Avoid dynamic allocation of `HeaderName` by using `from_static`.
-            /// https://github.com/hyperium/http/blob/e9de46c9269f0a476b34a02a401212e20f639df2/src/header/map.rs#L3794
-            const COOKIE2: HeaderName = HeaderName::from_static("cookie2");
+mod referrer {
+    use http::{
+        HeaderMap, HeaderValue, Uri,
+        header::{REFERER, REFERRER_POLICY},
+        uri::Scheme,
+    };
+    use url::Url;
 
-            headers.remove(AUTHORIZATION);
-            headers.remove(COOKIE);
-            headers.remove(COOKIE2);
-            headers.remove(PROXY_AUTHORIZATION);
-            headers.remove(WWW_AUTHENTICATE);
+    use crate::ext::UriExt;
+
+    /// Referrer state carried across a redirect chain.
+    #[derive(Clone, Default)]
+    pub(super) struct Referrer {
+        source: Option<Url>,
+        policy: ReferrerPolicy,
+    }
+
+    impl Referrer {
+        /// Captures the caller-provided referrer without changing the initial request.
+        ///
+        /// Redirect processing updates the policy before computing the next referrer:
+        /// https://w3c.github.io/webappsec-referrer-policy/#integration-with-fetch
+        pub(super) fn new(headers: &HeaderMap) -> Self {
+            Self {
+                source: headers.get(REFERER).and_then(parse_referrer),
+                policy: ReferrerPolicy::default(),
+            }
+        }
+
+        /// Applies the last recognized policy from a redirect response.
+        ///
+        /// https://w3c.github.io/webappsec-referrer-policy/#set-requests-referrer-policy-on-redirect
+        pub(super) fn on_redirect(&mut self, headers: &HeaderMap) {
+            match ReferrerPolicy::from(headers) {
+                ReferrerPolicy::None => {}
+                policy => self.policy = policy,
+            }
+        }
+
+        /// Computes the referrer for the next request in the redirect chain.
+        ///
+        /// https://w3c.github.io/webappsec-referrer-policy/#determine-requests-referrer
+        pub(super) fn apply<B>(&mut self, req: &mut http::Request<B>) {
+            let Some(mut source) = self.source.take() else {
+                req.headers_mut().remove(REFERER);
+                return;
+            };
+            let sensitive = req
+                .headers_mut()
+                .get(REFERER)
+                .is_some_and(HeaderValue::is_sensitive);
+
+            let Ok(source_scheme) = source.scheme().parse::<Scheme>() else {
+                req.headers_mut().remove(REFERER);
+                return;
+            };
+
+            let destination = req.uri();
+            let same_origin = same_origin(&source, &source_scheme, destination);
+            let downgrade =
+                source_scheme == Scheme::HTTPS && destination.scheme() == Some(&Scheme::HTTP);
+
+            let strip_to_origin = match self.policy {
+                ReferrerPolicy::NoReferrer => {
+                    req.headers_mut().remove(REFERER);
+                    return;
+                }
+                ReferrerPolicy::NoReferrerWhenDowngrade if downgrade => {
+                    req.headers_mut().remove(REFERER);
+                    return;
+                }
+                ReferrerPolicy::SameOrigin if !same_origin => {
+                    req.headers_mut().remove(REFERER);
+                    return;
+                }
+                ReferrerPolicy::StrictOrigin if downgrade => {
+                    req.headers_mut().remove(REFERER);
+                    return;
+                }
+                ReferrerPolicy::StrictOriginWhenCrossOrigin | ReferrerPolicy::None
+                    if !same_origin && downgrade =>
+                {
+                    req.headers_mut().remove(REFERER);
+                    return;
+                }
+                ReferrerPolicy::Origin | ReferrerPolicy::StrictOrigin => true,
+                ReferrerPolicy::OriginWhenCrossOrigin
+                | ReferrerPolicy::StrictOriginWhenCrossOrigin
+                | ReferrerPolicy::None => !same_origin,
+                ReferrerPolicy::NoReferrerWhenDowngrade
+                | ReferrerPolicy::SameOrigin
+                | ReferrerPolicy::UnsafeUrl => false,
+            };
+
+            if strip_to_origin {
+                strip_to_origin_url(&mut source);
+            }
+
+            match HeaderValue::try_from(source.as_str()) {
+                Ok(mut value) => {
+                    value.set_sensitive(sensitive);
+                    req.headers_mut().insert(REFERER, value);
+                    self.source = Some(source);
+                }
+                Err(_) => {
+                    req.headers_mut().remove(REFERER);
+                }
+            }
+        }
+    }
+
+    /// Referrer policies defined by the Referrer Policy specification.
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    enum ReferrerPolicy {
+        None,
+        NoReferrer,
+        NoReferrerWhenDowngrade,
+        SameOrigin,
+        Origin,
+        StrictOrigin,
+        OriginWhenCrossOrigin,
+        #[default]
+        StrictOriginWhenCrossOrigin,
+        UnsafeUrl,
+    }
+
+    /// Parses all policy tokens and keeps the last recognized value.
+    ///
+    /// https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-header
+    impl From<&HeaderMap> for ReferrerPolicy {
+        fn from(headers: &HeaderMap) -> Self {
+            let mut policy = Self::None;
+
+            for value in headers.get_all(REFERRER_POLICY) {
+                let Ok(value) = value.to_str() else {
+                    continue;
+                };
+
+                for token in value.split(',') {
+                    let parsed = Self::from(token.trim());
+                    if parsed != Self::None {
+                        policy = parsed;
+                    }
+                }
+            }
+
+            policy
+        }
+    }
+
+    impl From<&str> for ReferrerPolicy {
+        fn from(token: &str) -> Self {
+            const TOKENS: &[(&str, ReferrerPolicy)] = &[
+                ("no-referrer", ReferrerPolicy::NoReferrer),
+                (
+                    "no-referrer-when-downgrade",
+                    ReferrerPolicy::NoReferrerWhenDowngrade,
+                ),
+                ("same-origin", ReferrerPolicy::SameOrigin),
+                ("origin", ReferrerPolicy::Origin),
+                ("strict-origin", ReferrerPolicy::StrictOrigin),
+                (
+                    "origin-when-cross-origin",
+                    ReferrerPolicy::OriginWhenCrossOrigin,
+                ),
+                (
+                    "strict-origin-when-cross-origin",
+                    ReferrerPolicy::StrictOriginWhenCrossOrigin,
+                ),
+                ("unsafe-url", ReferrerPolicy::UnsafeUrl),
+            ];
+
+            match TOKENS
+                .iter()
+                .find(|(name, _)| token.eq_ignore_ascii_case(name))
+            {
+                Some((_, policy)) => *policy,
+                None => Self::None,
+            }
+        }
+    }
+
+    /// Parses an HTTP(S) referrer and strips credentials and fragments.
+    ///
+    /// `Referer` field syntax:
+    /// https://www.rfc-editor.org/rfc/rfc9110.html#section-10.1.3
+    ///
+    /// Referrer Policy URL stripping:
+    /// https://w3c.github.io/webappsec-referrer-policy/#strip-url
+    fn parse_referrer(value: &HeaderValue) -> Option<Url> {
+        let mut source = Url::parse(value.to_str().ok()?).ok()?;
+        let scheme = source.scheme().parse::<Scheme>().ok()?;
+        if scheme != Scheme::HTTP && scheme != Scheme::HTTPS {
+            return None;
+        }
+
+        source.set_username("").ok()?;
+        source.set_password(None).ok()?;
+        source.set_fragment(None);
+
+        if source.as_str().len() > 4096 {
+            strip_to_origin_url(&mut source);
+        }
+
+        Some(source)
+    }
+
+    fn strip_to_origin_url(url: &mut Url) {
+        url.set_path("");
+        url.set_query(None);
+        url.set_fragment(None);
+    }
+
+    fn same_origin(source: &Url, source_scheme: &Scheme, destination: &Uri) -> bool {
+        let same_host = match (source.host_str(), destination.host()) {
+            (Some(source), Some(destination)) => source.eq_ignore_ascii_case(destination),
+            (None, None) => true,
+            _ => false,
+        };
+
+        same_host
+            && destination.scheme() == Some(source_scheme)
+            && source.port_or_known_default() == Some(destination.port_or_default())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn headers_with_referrer(value: &'static str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(REFERER, HeaderValue::from_static(value));
+            headers
+        }
+
+        fn request(headers: HeaderMap, destination: &'static str) -> http::Request<()> {
+            let mut req = http::Request::new(());
+            *req.headers_mut() = headers;
+            *req.uri_mut() = Uri::from_static(destination);
+            req
+        }
+
+        fn apply(
+            source: &'static str,
+            destination: &'static str,
+            policy: Option<&'static str>,
+        ) -> Option<HeaderValue> {
+            let headers = headers_with_referrer(source);
+            let mut referrer = Referrer::new(&headers);
+
+            if let Some(policy) = policy {
+                let mut response_headers = HeaderMap::new();
+                response_headers.insert(REFERRER_POLICY, HeaderValue::from_static(policy));
+                referrer.on_redirect(&response_headers);
+            }
+
+            let mut req = request(headers, destination);
+            referrer.apply(&mut req);
+            req.headers().get(REFERER).cloned()
+        }
+
+        fn header_str(value: &Option<HeaderValue>) -> Option<&str> {
+            value.as_ref().and_then(|value| value.to_str().ok())
+        }
+
+        #[test]
+        fn applies_referrer_policy() {
+            let mut headers = HeaderMap::new();
+            headers.append(
+                REFERRER_POLICY,
+                HeaderValue::from_static("same-origin, future-policy"),
+            );
+            headers.append(REFERRER_POLICY, HeaderValue::from_static("ORIGIN, unknown"));
+
+            assert_eq!(ReferrerPolicy::from(&headers), ReferrerPolicy::Origin);
+            assert_eq!(ReferrerPolicy::from("future-policy"), ReferrerPolicy::None);
+
+            let cases = [
+                (
+                    "default same-origin",
+                    "https://user:pass@example.com/source?q=1#fragment",
+                    "https://example.com/target",
+                    None,
+                    Some("https://example.com/source?q=1"),
+                ),
+                (
+                    "default cross-origin",
+                    "https://example.com/source?q=1",
+                    "https://other.example/target",
+                    None,
+                    Some("https://example.com/"),
+                ),
+                (
+                    "default downgrade",
+                    "https://example.com/source",
+                    "http://example.com/target",
+                    None,
+                    None,
+                ),
+                (
+                    "no-referrer",
+                    "https://example.com/source",
+                    "https://other.example/target",
+                    Some("no-referrer"),
+                    None,
+                ),
+                (
+                    "no-referrer-when-downgrade",
+                    "https://example.com/source",
+                    "https://other.example/target",
+                    Some("no-referrer-when-downgrade"),
+                    Some("https://example.com/source"),
+                ),
+                (
+                    "same-origin",
+                    "https://example.com/source",
+                    "https://other.example/target",
+                    Some("same-origin"),
+                    None,
+                ),
+                (
+                    "origin",
+                    "https://example.com/source",
+                    "https://other.example/target",
+                    Some("origin"),
+                    Some("https://example.com/"),
+                ),
+                (
+                    "strict-origin",
+                    "https://example.com/source",
+                    "https://other.example/target",
+                    Some("strict-origin"),
+                    Some("https://example.com/"),
+                ),
+                (
+                    "origin-when-cross-origin",
+                    "https://example.com/source",
+                    "https://other.example/target",
+                    Some("origin-when-cross-origin"),
+                    Some("https://example.com/"),
+                ),
+                (
+                    "strict-origin-when-cross-origin",
+                    "https://example.com/source",
+                    "https://other.example/target",
+                    Some("strict-origin-when-cross-origin"),
+                    Some("https://example.com/"),
+                ),
+                (
+                    "unsafe-url",
+                    "https://example.com/source",
+                    "https://other.example/target",
+                    Some("unsafe-url"),
+                    Some("https://example.com/source"),
+                ),
+            ];
+
+            for (name, source, destination, policy, expected) in cases {
+                let actual = apply(source, destination, policy);
+                assert_eq!(header_str(&actual), expected, "case: {name}");
+            }
+
+            let mut value = HeaderValue::from_static("https://example.com/private");
+            value.set_sensitive(true);
+            let mut headers = HeaderMap::new();
+            headers.insert(REFERER, value);
+            let mut referrer = Referrer::new(&headers);
+
+            let mut req = request(headers, "https://other.example/");
+            referrer.apply(&mut req);
+            assert!(req.headers()[REFERER].is_sensitive());
+
+            let headers = headers_with_referrer("https://example.com/source");
+            let mut referrer = Referrer::new(&headers);
+            let mut req = request(headers, "https://example.com/first");
+
+            let mut response_headers = HeaderMap::new();
+            response_headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+            referrer.on_redirect(&response_headers);
+
+            referrer.apply(&mut req);
+
+            response_headers.insert(REFERRER_POLICY, HeaderValue::from_static("unsafe-url"));
+            referrer.on_redirect(&response_headers);
+
+            *req.uri_mut() = Uri::from_static("https://example.com/second");
+            referrer.apply(&mut req);
+
+            assert_eq!(req.headers().get(REFERER), None);
         }
     }
 }
@@ -562,14 +948,43 @@ mod tests {
         let mut prev = vec![Uri::try_from("http://initial-domain.com/new_path").unwrap()];
         let mut filtered_headers = headers.clone();
 
-        remove_sensitive_headers(&mut headers, &next, &prev);
-        assert_eq!(headers, filtered_headers);
+        let mut req = http::Request::new(());
+        *req.headers_mut() = headers;
+        *req.uri_mut() = next;
+
+        remove_sensitive_headers(&mut req, &prev);
+        assert_eq!(req.headers(), &filtered_headers);
 
         prev.push(Uri::try_from("http://new-domain.com/path").unwrap());
         filtered_headers.remove(AUTHORIZATION);
         filtered_headers.remove(COOKIE);
 
-        remove_sensitive_headers(&mut headers, &next, &prev);
-        assert_eq!(headers, filtered_headers);
+        remove_sensitive_headers(&mut req, &prev);
+        assert_eq!(req.headers(), &filtered_headers);
+
+        let mut default_port_headers = HeaderMap::new();
+        default_port_headers.insert(AUTHORIZATION, HeaderValue::from_static("let me in"));
+
+        let next = Uri::from_static("http://EXAMPLE.com:80/next");
+        let previous = vec![Uri::from_static("http://example.com/previous")];
+
+        let mut req = http::Request::new(());
+        *req.headers_mut() = default_port_headers;
+        *req.uri_mut() = next;
+
+        remove_sensitive_headers(&mut req, &previous);
+        assert_eq!(
+            req.headers().get(AUTHORIZATION),
+            Some(&HeaderValue::from_static("let me in"))
+        );
+
+        req.headers_mut()
+            .insert(COOKIE, HeaderValue::from_static("foo=bar"));
+        *req.uri_mut() = Uri::from_static("http://example.com:8443/next");
+        let previous = [Uri::from_static("https://example.com:8443/previous")];
+
+        remove_sensitive_headers(&mut req, &previous);
+        assert_eq!(req.headers().get(AUTHORIZATION), None);
+        assert_eq!(req.headers().get(COOKIE), None);
     }
 }
