@@ -98,7 +98,7 @@ where
 
     fn call(&mut self, descriptor: ConnectionDescriptor) -> Self::Future {
         let uri = descriptor.uri().clone();
-        let connect = self.http.call(uri.clone());
+        let connect = self.http.call(descriptor.connect_uri());
         let tls = self.tls.clone();
 
         let f = async move {

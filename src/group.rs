@@ -44,6 +44,7 @@ impl_group_variants! {
     Emulate(Group),
     Named(GroupId),
     Uri(Uri),
+    Destination(std::net::SocketAddr),
     Version(Version),
     Proxy(Matcher),
     SocketBind(Option<SocketBindOptions>),
@@ -72,6 +73,13 @@ impl Group {
     #[inline]
     pub(crate) fn uri(&mut self, uri: Uri) -> &mut Self {
         self.extend(GroupKey::Uri, GroupVariant::Uri(uri))
+    }
+
+    pub(crate) fn destination(&mut self, address: Option<std::net::SocketAddr>) -> &mut Self {
+        self.extend(
+            GroupKey::Destination,
+            address.map(GroupVariant::Destination),
+        )
     }
 
     /// Groups the request by its required HTTP [`Version`].

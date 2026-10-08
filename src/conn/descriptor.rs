@@ -28,6 +28,7 @@ pub(crate) struct ConnectionId(Arc<(Group, AtomicU64)>);
 #[derive(Clone)]
 pub(crate) struct ConnectionDescriptor {
     uri: Uri,
+    destination: Option<std::net::SocketAddr>,
     version: Option<Version>,
     proxy: Option<Matcher>,
     tls_options: Option<TlsOptions>,
@@ -93,6 +94,7 @@ impl ConnectionDescriptor {
 
         ConnectionDescriptor {
             uri,
+            destination: None,
             proxy,
             version,
             tls_options,
@@ -100,6 +102,36 @@ impl ConnectionDescriptor {
             connection_id,
             tls_capture: None,
         }
+    }
+
+    pub(crate) fn with_destination(mut self, address: Option<std::net::SocketAddr>) -> Self {
+        self.destination = address;
+        let mut group = self.connection_id.0.0.clone();
+        group.destination(address);
+        self.connection_id = ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN))));
+        self
+    }
+
+    pub(crate) fn destination(&self) -> Option<std::net::SocketAddr> {
+        self.destination
+    }
+
+    pub(crate) fn connect_uri(&self) -> Uri {
+        match self.destination {
+            Some(address) => Self::uri_for_address(&self.uri, address),
+            None => self.uri.clone(),
+        }
+    }
+
+    pub(crate) fn uri_for_address(uri: &Uri, address: std::net::SocketAddr) -> Uri {
+        let mut parts = uri.clone().into_parts();
+        parts.authority = Some(
+            address
+                .to_string()
+                .parse()
+                .expect("socket addresses are valid authorities"),
+        );
+        Uri::from_parts(parts).expect("replacing an absolute URI authority preserves validity")
     }
 
     pub(crate) fn with_tls_capture(mut self, capture: Option<crate::tls::TlsCaptureSlot>) -> Self {

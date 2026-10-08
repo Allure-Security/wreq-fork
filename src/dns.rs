@@ -20,6 +20,33 @@ pub(crate) use self::{
     sealed::{DnsResolver, resolve},
 };
 
+/// A caller-validated destination IP, bound to the request's original origin.
+///
+/// Insert this into a request's extensions after validating its URL and DNS
+/// answers. Direct TCP, HTTP CONNECT, absolute-form proxy requests and SOCKS
+/// use this address while HTTP Host and TLS SNI retain the original hostname.
+/// It participates in connection-pool identity. Automatic redirects to a new
+/// origin fail closed: callers must validate and pin the redirected request.
+#[derive(Debug, Clone)]
+pub struct PinnedDestination {
+    pub(crate) origin: (Option<http::uri::Scheme>, Option<http::uri::Authority>),
+    pub(crate) address: SocketAddr,
+}
+
+impl PinnedDestination {
+    /// Bind a validated socket address to this URI's scheme and authority.
+    pub fn new(uri: &http::Uri, address: SocketAddr) -> Self {
+        Self {
+            origin: (uri.scheme().cloned(), uri.authority().cloned()),
+            address,
+        }
+    }
+
+    pub(crate) fn matches(&self, uri: &http::Uri) -> bool {
+        self.origin.0.as_ref() == uri.scheme() && self.origin.1.as_ref() == uri.authority()
+    }
+}
+
 /// A wrapper around `Vec<SocketAddr>` to implement the `Iterator` trait.
 pub(crate) struct SocketAddrs {
     iter: vec::IntoIter<SocketAddr>,

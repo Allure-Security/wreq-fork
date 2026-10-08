@@ -372,7 +372,7 @@ impl TransportConnector {
                             socks.set_auth(proxy.raw_auth());
                             socks.set_version(version);
                             socks.set_dns_mode(dns_resolve);
-                            socks.call(uri).await?
+                            socks.call(descriptor.connect_uri()).await?
                         };
 
                         // Build an HTTPS connector.
@@ -416,7 +416,7 @@ impl TransportConnector {
                         }
 
                         // Connect to the proxy and establish the tunnel.
-                        tunnel.call(uri).await?
+                        tunnel.call(descriptor.connect_uri()).await?
                     };
 
                     // Wrap the established tunneled stream with TLS.
@@ -434,6 +434,7 @@ impl TransportConnector {
                     return self.tunnel_conn_from_stream(io);
                 }
 
+                descriptor = descriptor.with_destination(None);
                 *descriptor.uri_mut() = proxy_uri;
                 self.connect_auto_proxy(descriptor, proxy)
                     .await
@@ -462,7 +463,7 @@ impl TransportConnector {
                         let mut tunnel =
                             proxy::tunnel::TunnelConnector::new(proxy_uri, connector.clone());
 
-                        tunnel.call(uri).await?
+                        tunnel.call(descriptor.connect_uri()).await?
                     };
 
                     // Wrap the established tunneled stream with TLS.

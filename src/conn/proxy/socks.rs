@@ -175,8 +175,9 @@ where
                 .map_err(SocksError::ConnectFailed)?;
 
             // Resolve the target address using the provided resolver.
-            let target_addr = match dns_resolve {
-                DnsResolve::Local => {
+            let target_addr = match (host.parse::<std::net::IpAddr>(), dns_resolve) {
+                (Ok(ip), _) => TargetAddr::Ip(std::net::SocketAddr::new(ip, port)),
+                (Err(_), DnsResolve::Local) => {
                     let mut socket_addr = resolve(&mut resolver, Name::new(host.into()))
                         .await
                         .map(|mut s| s.next())
@@ -187,7 +188,7 @@ where
                     socket_addr.set_port(port);
                     TargetAddr::Ip(socket_addr)
                 }
-                DnsResolve::Remote => TargetAddr::Domain(Cow::Borrowed(host), port),
+                (Err(_), DnsResolve::Remote) => TargetAddr::Domain(Cow::Borrowed(host), port),
             };
 
             match version {

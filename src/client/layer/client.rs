@@ -153,6 +153,20 @@ where
         &self,
         mut req: Request<B>,
     ) -> BoxFuture<'static, Result<Response<Incoming>, BoxError>> {
+        let destination = req.extensions().get::<crate::dns::PinnedDestination>();
+        if destination.is_some_and(|pin| !pin.matches(req.uri())) {
+            return Box::pin(future::err(
+                Error::new(
+                    ErrorKind::Connect,
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "pinned destination origin changed",
+                    ),
+                )
+                .into(),
+            ));
+        }
+        let destination = destination.map(|pin| pin.address);
         let is_http_connect = req.method() == Method::CONNECT;
         // Validate HTTP version early
         match req.version() {
@@ -198,6 +212,7 @@ where
             }
 
             ConnectionDescriptor::new(uri, group, proxy, version, tls_options, socket_bind_options)
+                .with_destination(destination)
                 .with_tls_capture(req.extensions().get::<TlsCaptureSlot>().cloned())
         };
 
@@ -244,6 +259,7 @@ where
         descriptor: ConnectionDescriptor,
     ) -> Result<Response<Incoming>, TrySendError<B>> {
         let capture = descriptor.tls_capture();
+        let destination = descriptor.destination();
         let mut pooled = self
             .connection_for(descriptor)
             .await
@@ -289,6 +305,9 @@ where
                 }
 
                 absolute_form(req.uri_mut());
+                if let Some(address) = destination {
+                    *req.uri_mut() = ConnectionDescriptor::uri_for_address(req.uri(), address);
+                }
             } else {
                 origin_form(req.uri_mut());
             }

@@ -15,3 +15,15 @@ cargo +nightly fmt --all -- --check
 ```
 
 Applications should pin this fork by Git revision and commit their Cargo.lock. The empty workspace declaration permits standalone fork testing even when checked out inside an application's directory.
+
+## Caller-validated destination pinning
+
+`wreq::dns::PinnedDestination::new(&uri, socket_address)` can be inserted into request extensions after application URL/DNS validation. Direct connections, HTTP proxy absolute-form requests, HTTPS CONNECT tunnels, and SOCKS use that socket address. HTTP Host, TLS SNI, certificate verification and evidence retain the original origin. The pin participates in connection-pool identity, so an older connection cannot substitute another checked IP.
+
+The extension binds approval to the URI scheme and authority. Cross-origin automatic redirects fail closed. Callers following redirects manually must validate every destination and insert a fresh pin. A pin does not itself validate addresses or make an untrusted proxy trustworthy; the application owns that policy.
+
+`tests/pinned_destination.rs` uses local fixtures to cover direct pool isolation, HTTP proxy routing, CONNECT with original SNI and TLS evidence, SOCKS remote-DNS pinning, and cross-origin redirect rejection.
+
+```sh
+cargo test --all-features --lib --tests
+```
